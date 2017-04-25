@@ -2090,6 +2090,11 @@ void vgt_kick_off_execlists(struct vgt_device *vgt)
 						-rc, num, j);
 				break;
 			}
+
+			/* If vgt is not high priority, kick off one execlist once */
+			if(vgt_rt_policy == VGT_RT_ENABLED &&
+				vgt->vgt_priority != VGT_HIGH_PRIORITY)
+				break;
 		}
 	}
 }
@@ -2401,8 +2406,15 @@ bool vgt_batch_ELSP_write(struct vgt_device *vgt, int ring_id)
 
 		if (rc < 0 && rc != -EBUSY)
 			return false;
-	}
+	} else if(vgt_ctx_switch && vgt_rt_policy==VGT_RT_ENABLED &&
+			 vgt->vgt_priority >= VGT_DEFAULT_PRIORITY) {
+		int num = vgt_el_slots_number(&vgt->rb[ring_id]);
+		struct pgt_device *pdev = vgt->pdev;
 
+		if(num>1) {
+			vgt_raise_request(pdev, VGT_REQUEST_SCHED);
+		}
+	}
 	return true;
 }
 

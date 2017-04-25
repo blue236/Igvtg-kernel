@@ -87,7 +87,7 @@ bool event_based_qos = false;
 module_param_named(event_based_qos, event_based_qos, bool, 0400);
 MODULE_PARM_DESC(event_based_qos, "Use event based QoS scheduler (default: false)");
 
-int tbs_period_ms = -1;
+int tbs_period_ms = 1;
 module_param_named(tbs_period_ms, tbs_period_ms, int, 0600);
 MODULE_PARM_DESC(tbs_period_ms, "Set the time based QoS scheduler timer in unit of ms (default: BDW 1ms, HSW 15ms)");
 
@@ -180,6 +180,13 @@ module_param_named(enable_reset, enable_reset, bool, 0600);
 
 int hang_threshold = 200;
 module_param_named(hang_threshold, hang_threshold, int, 0600);
+
+/* possible value of rt_policy:
+ * 0: (default) real-time policy is disabled.
+ * 1: real-time policy is enabled with vgt_priority & vgt_preemption.
+ */
+int vgt_rt_policy = 0;
+module_param_named(vgt_rt_policy, vgt_rt_policy, int, 0600);
 
 /* possible value of preemption_policy:
  * 0: (default) pre-emption and lite-restore are enabled.
@@ -1030,6 +1037,8 @@ static int vgt_initialize(struct pci_dev *dev)
 	vp.vgt_primary = 1; /* this isn't actually used for dom0 */
 	/* there is no upper cap for dom0 */
 	vp.cap = 0;
+	vp.vgt_priority = VGT_DEFAULT_PRIORITY;
+	vp.tbs_period_ms = tbs_period_ms;
 	if (create_vgt_instance(pdev, &vgt_dom0, vp) < 0)
 		goto err;
 

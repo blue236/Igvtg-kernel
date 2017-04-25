@@ -116,9 +116,17 @@ extern bool opregion_present;
 extern int preemption_policy;
 extern bool vblank_broadcast;
 extern bool logd_enable;
+extern int vgt_rt_policy;
 
 #define VGT_PREEMPTION_DISABLED   (1<<0)
 #define VGT_LITERESTORE_DISABLED  (1<<1)
+
+#define VGT_RT_ENABLED            (1)
+#define VGT_RT_DISABLED           (0)
+
+#define VGT_HIGH_PRIORITY         (3)
+#define VGT_DEFAULT_PRIORITY      (2)
+#define VGT_LOW_PRIORITY          (1)
 
 #define vgt_dbg(component, fmt, s...)	\
 	do { if (vgt_debug & component) printk(KERN_DEBUG "vGT debug:(%s:%d) " fmt, __FUNCTION__, __LINE__, ##s); } while (0)
@@ -375,6 +383,8 @@ struct vgt_device {
 	unsigned long *reset_count_start_time; /*record each reset time*/
 	int reset_count;
 	int reset_count_head; /*sliding window methods*/
+	int vgt_priority;
+	int tbs_period_ms;
 
 	/* migration support */
 	vgt_image_header_t image_header;
@@ -1390,9 +1400,9 @@ static inline void vgt_init_sched_info(struct vgt_device *vgt)
 	}
 
 	if (timer_based_qos) {
-		ctx_tbs_period(vgt) = VGT_TBS_DEFAULT_PERIOD(tbs_period_ms);
+		ctx_tbs_period(vgt) = VGT_TBS_DEFAULT_PERIOD(vgt->tbs_period_ms);
 		vgt_info("VM-%d setup timebased schedule period %d ms\n",
-			vgt->vm_id, tbs_period_ms);
+			vgt->vm_id, vgt->tbs_period_ms);
 	}
 }
 
