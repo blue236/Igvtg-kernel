@@ -117,9 +117,9 @@ int create_vgt_instance(struct pgt_device *pdev, struct vgt_device **ptr_vgt, vg
 	int i;
 
 	vgt_info("vm_id=%d, low_gm_sz=%dMB, high_gm_sz=%dMB, fence_sz=%d,"
-					"vgt_primary=%d, vgt_cap=%d\n",
+			 "vgt_primary=%d, vgt_cap=%d, vgt_priority=%d, tbs_period_ms=%d\n",
 		vp.vm_id, vp.aperture_sz, vp.gm_sz-vp.aperture_sz, vp.fence_sz,
-					vp.vgt_primary, vp.cap);
+		vp.vgt_primary, vp.cap, vp.vgt_priority, vp.tbs_period_ms);
 	vgt = vzalloc(sizeof(*vgt));
 	if (vgt == NULL) {
 		printk("Insufficient memory for vgt_device in %s\n", __FUNCTION__);
@@ -337,6 +337,13 @@ int create_vgt_instance(struct pgt_device *pdev, struct vgt_device **ptr_vgt, vg
 	vgt_info("VM-%d set cap %d\n", vgt->vm_id, vgt_cap(vgt));
 
 	/* initialize context scheduler infor */
+    if(vgt_rt_policy==VGT_RT_ENABLED) {
+        vgt->vgt_priority = vp.vgt_priority;
+        vgt->tbs_period_ms = vp.tbs_period_ms;
+    } else {
+        vgt->vgt_priority = VGT_DEFAULT_PRIORITY;
+        vgt->tbs_period_ms = tbs_period_ms;
+    }
 	vgt_init_sched_info(vgt);
 
 	if (shadow_tail_based_qos)

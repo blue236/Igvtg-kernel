@@ -907,6 +907,8 @@ void vgt_sched_update_next(struct vgt_device *vgt)
 void vgt_schedule(struct pgt_device *pdev)
 {
 	static u64 timer_check;
+	struct vgt_device *cur_vgt = current_render_owner(pdev);
+
 	ASSERT(spin_is_locked(&pdev->lock));
 
 	if (vgt_nr_in_runq(pdev) < 2)
@@ -915,8 +917,18 @@ void vgt_schedule(struct pgt_device *pdev)
 	if (!(timer_check++ % VGT_TS_BALANCE_PERIOD))
 		vgt_timeslice_balance(pdev);
 
-	pdev->next_sched_vgt = tbs_next_vgt(&pdev->rendering_runq_head,
-			current_render_owner(pdev));
+	if(vgt_rt_policy==VGT_RT_ENABLED &&
+		cur_vgt->vgt_priority==VGT_HIGH_PRIORITY &&
+		!vgt_vrings_empty(cur_vgt)) {
+        /*
+            If vgt_rt_policy is enabled and the high priority vgt still has
+            requests in vrings, skip scheduling.
+         */
+
+		return;
+	}
+
+	pdev->next_sched_vgt = tbs_next_vgt(&pdev->rendering_runq_head,	cur_vgt);
 }
 
 

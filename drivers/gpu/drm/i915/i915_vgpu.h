@@ -185,6 +185,8 @@ typedef struct {
 
 	int vgt_primary; /* 0/1: config the vgt device as secondary/primary VGA,
 						-1: means the ioemu doesn't supply a value */
+	int vgt_priority; /* (high 3/default 2/low 1) realtime priority value of vgt */
+	int tbs_period_ms; /* (1 <= x <= 15) additional scheduling period(ms) for rt */
 } vgt_params_t;
 
 struct vgt_device;
