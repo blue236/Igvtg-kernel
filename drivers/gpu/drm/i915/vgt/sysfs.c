@@ -46,16 +46,20 @@ static ssize_t vgt_create_instance_store(struct kobject *kobj, struct kobj_attri
 	int high_gm_sz;
 	int low_gm_sz;
 
+	memset(&vp, 0, sizeof(vgt_params_t));
+
 	/* We expect the param_str should be vmid,a,b,c (where the guest
 	* wants a MB aperture and b MB gm, and c fence registers) or -vmid
 	* (where we want to release the vgt instance).
 	*/
 	(void)sscanf(buf, "%63s", param_str);
-	param_cnt = sscanf(param_str, "%d,%d,%d,%d,%d,%d", &vp.vm_id,
+	param_cnt = sscanf(param_str, "%d,%d,%d,%d,%d,%d,%d,%d", &vp.vm_id,
 		&low_gm_sz, &high_gm_sz, &vp.fence_sz, &vp.vgt_primary,
-		&vp.cap);
+		&vp.cap, &vp.vgt_priority, &vp.tbs_period_ms);
 	vp.aperture_sz = low_gm_sz;
 	vp.gm_sz = high_gm_sz + low_gm_sz;
+	vgt_info("vp.vgt_priority = %d, vp.tbs_period_ms = %d\n",
+		vp.vgt_priority, vp.tbs_period_ms);
 
 	if (param_cnt == 1) {
 		if (vp.vm_id >= 0)
@@ -74,10 +78,17 @@ static ssize_t vgt_create_instance_store(struct kobject *kobj, struct kobj_attri
 		} else {
 			vp.cap = 0; /* The default, 0, means there is no upper cap. */
 			vp.vgt_primary = -1; /* no valid value specified. */
+			vp.vgt_priority = VGT_DEFAULT_PRIORITY;
+			vp.tbs_period_ms = tbs_period_ms;
 		}
-	} else
+	} else if (param_cnt == 7 || param_cnt == 8) {
+		if(vp.vgt_priority < VGT_LOW_PRIORITY || vp.vgt_priority < VGT_HIGH_PRIORITY)
+			vp.vgt_priority = VGT_DEFAULT_PRIORITY;
+		if(vp.tbs_period_ms < VGT_TBS_PERIOD_MIN|| vp.tbs_period_ms > VGT_TBS_PERIOD_MAX)
+			vp.tbs_period_ms = tbs_period_ms;
+	} else {
 		return -EINVAL;
-
+	}
 	rc = (vp.vm_id > 0) ? vgt_add_state_sysfs(vp) : vgt_del_state_sysfs(vp);
 
 	return rc < 0 ? rc : count;
@@ -175,6 +186,30 @@ static ssize_t vgt_validate_ctx_switch_store(struct kobject *kobj,
 	if (sscanf(buf, "%du", &val) != 1)
 		return -EINVAL;
 	vgt_validate_ctx_switch = !!val;
+	return count;
+}
+
+static ssize_t vgt_rt_policy_show(struct kobject *kobj, struct kobj_attribute *attr,
+			char *buf)
+{
+	return sprintf(buf, "VGT realtime sched policy : %s\n",
+			(vgt_rt_policy ? "On" : "Off"));
+}
+
+static ssize_t vgt_rt_policy_store(struct kobject *kobj, struct kobj_attribute *attr,
+			const char *buf, size_t count)
+{
+	int val;
+	bool enabled;
+
+	if (sscanf(buf, "%du", &val) != 1)
+		return -EINVAL;
+	enabled = !!val;
+	if(enabled)
+		vgt_rt_policy = 1;
+	else
+		vgt_rt_policy = 0;
+
 	return count;
 }
 
@@ -303,6 +338,9 @@ static struct kobj_attribute dpy_switch_attrs =
 static struct kobj_attribute available_res_attrs =
 	__ATTR(available_resource, 0440, vgt_available_res_show, NULL);
 
+static struct kobj_attribute rt_policy_attrs =
+	__ATTR(rt_sched_policy, 0660, vgt_rt_policy_show, vgt_rt_policy_store);
+
 static struct attribute *vgt_ctrl_attrs[] = {
 	&create_vgt_instance_attrs.attr,
 	&display_owner_ctrl_attrs.attr,
@@ -312,6 +350,7 @@ static struct attribute *vgt_ctrl_attrs[] = {
 	&validate_ctx_switch_attrs.attr,
 	&dpy_switch_attrs.attr,
 	&available_res_attrs.attr,
+	&rt_policy_attrs.attr,
 	NULL,	/* need to NULL terminate the list of attributes */
 };
 
@@ -1007,6 +1046,53 @@ static ssize_t vgpu_hw_utilization_show(struct kobject *kobj, struct kobj_attrib
        return sprintf(buf, "%d\n", utilization);
 }
 
+static ssize_t vgt_priority_show(struct kobject *kobj, struct kobj_attribute *attr,char *buf)
+{
+	struct vgt_device *vgt = kobj_to_vgt(kobj);
+	return sprintf(buf, "%d\n", vgt->vgt_priority);
+}
+
+static ssize_t vgt_priority_store(struct kobject *kobj, struct kobj_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct vgt_device *vgt = kobj_to_vgt(kobj);
+	int vgt_priority;
+	if (sscanf(buf, "%d", &vgt_priority) != 1)
+		return -EINVAL;
+
+	if (vgt_priority < VGT_LOW_PRIORITY || vgt_priority > VGT_HIGH_PRIORITY) {
+		vgt_warn("val : %d, Please input among 1(low),2(mid) and 3(high) values!\n", vgt_priority);
+		return -EINVAL;
+	}
+	vgt->vgt_priority = vgt_priority;
+
+	return count;
+}
+
+static ssize_t tbs_period_ms_show(struct kobject *kobj, struct kobj_attribute *attr,char *buf)
+{
+	struct vgt_device *vgt = kobj_to_vgt(kobj);
+	return sprintf(buf, "%d\n", vgt->tbs_period_ms);
+}
+
+static ssize_t tbs_period_ms_store(struct kobject *kobj, struct kobj_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct vgt_device *vgt = kobj_to_vgt(kobj);
+	int tbs_period;
+	if (sscanf(buf, "%d", &tbs_period) != 1)
+		return -EINVAL;
+
+	if (tbs_period < VGT_TBS_PERIOD_MIN|| tbs_period > VGT_TBS_PERIOD_MAX) {
+		vgt_warn("val : %d, Please input among 0 ~ 9 (ms) values!\n", tbs_period);
+		return -EINVAL;
+	}
+	vgt->tbs_period_ms = tbs_period;
+	ctx_tbs_period(vgt) = VGT_TBS_DEFAULT_PERIOD(tbs_period);
+
+	return count;
+}
+
 static struct kobj_attribute vgt_id_attribute =
 	__ATTR_RO(vgt_id);
 
@@ -1031,6 +1117,12 @@ static struct kobj_attribute start_attribute =
 static struct kobj_attribute vgpu_hw_utilization_attribute =
         __ATTR_RO(vgpu_hw_utilization);
 
+static struct kobj_attribute vgt_priority_attribute =
+	__ATTR_RW(vgt_priority);
+
+static struct kobj_attribute tbs_period_attribute =
+	__ATTR_RW(tbs_period_ms);
+
 /*
  * Create a group of attributes so that we can create and destroy them all
  * at once.
@@ -1044,6 +1136,8 @@ static struct attribute *vgt_instance_attrs[] = {
 	&schedule_attribute.attr,
 	&start_attribute.attr,
 	&vgpu_hw_utilization_attribute.attr,
+	&vgt_priority_attribute.attr,
+	&tbs_period_attribute.attr,
 	NULL,	/* need to NULL terminate the list of attributes */
 };
 
