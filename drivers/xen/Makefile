@@ -9,6 +9,9 @@ CFLAGS_features.o			:= $(nostackp)
 
 CFLAGS_efi.o				+= -fshort-wchar
 
+VGT			:= drivers/gpu/drm/i915/vgt
+CFLAGS_xengt.o		+= -Wall -Werror -I$(VGT)
+
 dom0-$(CONFIG_PCI) += pci.o
 dom0-$(CONFIG_USB_SUPPORT) += dbgp.o
 dom0-$(CONFIG_XEN_ACPI) += acpi.o $(xen-pad-y)
@@ -36,6 +39,8 @@ obj-$(CONFIG_XEN_ACPI_PROCESSOR)	+= xen-acpi-processor.o
 obj-$(CONFIG_XEN_EFI)			+= efi.o
 obj-$(CONFIG_XEN_SCSI_BACKEND)		+= xen-scsiback.o
 obj-$(CONFIG_XEN_AUTO_XLATE)		+= xlate_mmu.o
+obj-$(CONFIG_XENGT)			+= xengt.o
+
 xen-evtchn-y				:= evtchn.o
 xen-gntdev-y				:= gntdev.o
 xen-gntalloc-y				:= gntalloc.o
