@@ -50,7 +50,7 @@
  */
 
 #define GEN9_ENABLE_DC5(dev) 0
-#define SKL_ENABLE_DC6(dev) IS_SKYLAKE(dev)
+#define SKL_ENABLE_DC6(dev) (HAS_CSR(dev) && IS_SKYLAKE(dev))
 
 #define for_each_power_well(i, power_well, domain_mask, power_domains)	\
 	for (i = 0;							\
@@ -362,7 +362,6 @@ static void hsw_set_power_well(struct drm_i915_private *dev_priv,
 	BIT(POWER_DOMAIN_AUX_C) |			\
 	BIT(POWER_DOMAIN_AUDIO) |			\
 	BIT(POWER_DOMAIN_VGA) |				\
-	BIT(POWER_DOMAIN_GMBUS) |			\
 	BIT(POWER_DOMAIN_INIT))
 #define BXT_DISPLAY_POWERWELL_1_POWER_DOMAINS (		\
 	BXT_DISPLAY_POWERWELL_2_POWER_DOMAINS |		\
@@ -552,7 +551,7 @@ static void assert_can_disable_dc6(struct drm_i915_private *dev_priv)
 		  "DC6 already programmed to be disabled.\n");
 }
 
-static void skl_enable_dc6(struct drm_i915_private *dev_priv)
+void skl_enable_dc6(struct drm_i915_private *dev_priv)
 {
 	uint32_t val;
 
@@ -569,7 +568,7 @@ static void skl_enable_dc6(struct drm_i915_private *dev_priv)
 	POSTING_READ(DC_STATE_EN);
 }
 
-static void skl_disable_dc6(struct drm_i915_private *dev_priv)
+void skl_disable_dc6(struct drm_i915_private *dev_priv)
 {
 	uint32_t val;
 
@@ -630,10 +629,10 @@ static void skl_set_power_well(struct drm_i915_private *dev_priv,
 				!I915_READ(HSW_PWR_WELL_BIOS),
 				"Invalid for power well status to be enabled, unless done by the BIOS, \
 				when request is to disable!\n");
-			if ((GEN9_ENABLE_DC5(dev) || SKL_ENABLE_DC6(dev)) &&
-				power_well->data == SKL_DISP_PW_2) {
+			if (power_well->data == SKL_DISP_PW_2) {
+				if (GEN9_ENABLE_DC5(dev))
+					gen9_disable_dc5(dev_priv);
 				if (SKL_ENABLE_DC6(dev)) {
-					skl_disable_dc6(dev_priv);
 					/*
 					 * DDI buffer programming unnecessary during driver-load/resume
 					 * as it's already done during modeset initialization then.
@@ -641,8 +640,6 @@ static void skl_set_power_well(struct drm_i915_private *dev_priv,
 					 */
 					if (!dev_priv->power_domains.initializing)
 						intel_prepare_ddi(dev);
-				} else {
-					gen9_disable_dc5(dev_priv);
 				}
 			}
 			I915_WRITE(HSW_PWR_WELL_DRIVER, tmp | req_mask);
@@ -668,7 +665,7 @@ static void skl_set_power_well(struct drm_i915_private *dev_priv,
 				DRM_DEBUG_KMS("Disabling %s\n", power_well->name);
 			}
 
-			if ((GEN9_ENABLE_DC5(dev) || SKL_ENABLE_DC6(dev)) &&
+			if (GEN9_ENABLE_DC5(dev) &&
 				power_well->data == SKL_DISP_PW_2) {
 				enum csr_state state;
 				/* TODO: wait for a completion event or
@@ -681,10 +678,7 @@ static void skl_set_power_well(struct drm_i915_private *dev_priv,
 					DRM_DEBUG("CSR firmware not ready (%d)\n",
 							state);
 				else
-					if (SKL_ENABLE_DC6(dev))
-						skl_enable_dc6(dev_priv);
-					else
-						gen9_enable_dc5(dev_priv);
+					gen9_enable_dc5(dev_priv);
 			}
 		}
 	}
@@ -1484,7 +1478,6 @@ void intel_display_power_put(struct drm_i915_private *dev_priv,
 	BIT(POWER_DOMAIN_AUX_B) |			\
 	BIT(POWER_DOMAIN_AUX_C) |			\
 	BIT(POWER_DOMAIN_AUX_D) |			\
-	BIT(POWER_DOMAIN_GMBUS) |			\
 	BIT(POWER_DOMAIN_INIT))
 #define HSW_DISPLAY_POWER_DOMAINS (				\
 	(POWER_DOMAIN_MASK & ~HSW_ALWAYS_ON_POWER_DOMAINS) |	\
@@ -1813,21 +1806,6 @@ static struct i915_power_well bxt_power_wells[] = {
 	}
 };
 
-static int
-sanitize_disable_power_well_option(const struct drm_i915_private *dev_priv,
-				   int disable_power_well)
-{
-	if (disable_power_well >= 0)
-		return !!disable_power_well;
-
-	if (IS_SKYLAKE(dev_priv)) {
-		DRM_DEBUG_KMS("Disabling display power well support\n");
-		return 0;
-	}
-
-	return 1;
-}
-
 #define set_power_wells(power_domains, __power_wells) ({		\
 	(power_domains)->power_wells = (__power_wells);			\
 	(power_domains)->power_well_count = ARRAY_SIZE(__power_wells);	\
@@ -1844,11 +1822,6 @@ int intel_power_domains_init(struct drm_i915_private *dev_priv)
 {
 	struct i915_power_domains *power_domains = &dev_priv->power_domains;
 
-	i915.disable_power_well = sanitize_disable_power_well_option(dev_priv,
-						     i915.disable_power_well);
-
-	BUILD_BUG_ON(POWER_DOMAIN_NUM > 31);
-
 	mutex_init(&power_domains->lock);
 
 	/*
@@ -1859,7 +1832,7 @@ int intel_power_domains_init(struct drm_i915_private *dev_priv)
 		set_power_wells(power_domains, hsw_power_wells);
 	} else if (IS_BROADWELL(dev_priv->dev)) {
 		set_power_wells(power_domains, bdw_power_wells);
-	} else if (IS_SKYLAKE(dev_priv->dev)) {
+	} else if (IS_SKYLAKE(dev_priv->dev) || IS_KABYLAKE(dev_priv->dev)) {
 		set_power_wells(power_domains, skl_power_wells);
 	} else if (IS_BROXTON(dev_priv->dev)) {
 		set_power_wells(power_domains, bxt_power_wells);
@@ -2065,6 +2038,36 @@ void intel_power_domains_init_hw(struct drm_i915_private *dev_priv)
 	intel_display_set_init_power(dev_priv, true);
 	intel_power_domains_resume(dev_priv);
 	power_domains->initializing = false;
+}
+
+/**
+ * intel_aux_display_runtime_get - grab an auxiliary power domain reference
+ * @dev_priv: i915 device instance
+ *
+ * This function grabs a power domain reference for the auxiliary power domain
+ * (for access to the GMBUS and DP AUX blocks) and ensures that it and all its
+ * parents are powered up. Therefore users should only grab a reference to the
+ * innermost power domain they need.
+ *
+ * Any power domain reference obtained by this function must have a symmetric
+ * call to intel_aux_display_runtime_put() to release the reference again.
+ */
+void intel_aux_display_runtime_get(struct drm_i915_private *dev_priv)
+{
+	intel_runtime_pm_get(dev_priv);
+}
+
+/**
+ * intel_aux_display_runtime_put - release an auxiliary power domain reference
+ * @dev_priv: i915 device instance
+ *
+ * This function drops the auxiliary power domain reference obtained by
+ * intel_aux_display_runtime_get() and might power down the corresponding
+ * hardware block right away if this is the last reference.
+ */
+void intel_aux_display_runtime_put(struct drm_i915_private *dev_priv)
+{
+	intel_runtime_pm_put(dev_priv);
 }
 
 /**

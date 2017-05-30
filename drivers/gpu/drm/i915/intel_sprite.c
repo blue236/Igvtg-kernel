@@ -38,7 +38,6 @@
 #include "intel_drv.h"
 #include <drm/i915_drm.h>
 #include "i915_drv.h"
-#include <linux/locallock.h>
 
 static bool
 format_is_yuv(uint32_t format)
@@ -64,8 +63,6 @@ static int usecs_to_scanlines(const struct drm_display_mode *adjusted_mode,
 	return DIV_ROUND_UP(usecs * adjusted_mode->crtc_clock,
 			    1000 * adjusted_mode->crtc_htotal);
 }
-
-static DEFINE_LOCAL_IRQ_LOCK(pipe_update_lock);
 
 /**
  * intel_pipe_update_start() - start update of a set of display registers
@@ -99,7 +96,7 @@ void intel_pipe_update_start(struct intel_crtc *crtc)
 	min = vblank_start - usecs_to_scanlines(adjusted_mode, 100);
 	max = vblank_start - 1;
 
-	local_lock_irq(pipe_update_lock);
+	local_irq_disable();
 
 	if (min <= 0 || max <= 0)
 		return;
@@ -129,11 +126,11 @@ void intel_pipe_update_start(struct intel_crtc *crtc)
 			break;
 		}
 
-		local_unlock_irq(pipe_update_lock);
+		local_irq_enable();
 
 		timeout = schedule_timeout(timeout);
 
-		local_lock_irq(pipe_update_lock);
+		local_irq_disable();
 	}
 
 	finish_wait(wq, &wait);
@@ -167,7 +164,7 @@ void intel_pipe_update_end(struct intel_crtc *crtc)
 
 	trace_i915_pipe_update_end(crtc, end_vbl_count, scanline_end);
 
-	local_unlock_irq(pipe_update_lock);
+	local_irq_enable();
 
 	if (crtc->debug.start_vbl_count &&
 	    crtc->debug.start_vbl_count != end_vbl_count) {
@@ -195,10 +192,9 @@ skl_update_plane(struct drm_plane *drm_plane, struct drm_crtc *crtc,
 	const int pipe = intel_plane->pipe;
 	const int plane = intel_plane->plane + 1;
 	u32 plane_ctl, stride_div, stride;
-	int pixel_size = drm_format_plane_cpp(fb->pixel_format, 0);
 	const struct drm_intel_sprite_colorkey *key =
 		&to_intel_plane_state(drm_plane->state)->ckey;
-	u32 surf_addr;
+	unsigned long surf_addr;
 	u32 tile_height, plane_offset, plane_size;
 	unsigned int rotation;
 	int x_offset, y_offset;
@@ -214,10 +210,6 @@ skl_update_plane(struct drm_plane *drm_plane, struct drm_crtc *crtc,
 
 	rotation = drm_plane->state->rotation;
 	plane_ctl |= skl_plane_ctl_rotation(rotation);
-
-	intel_update_sprite_watermarks(drm_plane, crtc, src_w, src_h,
-				       pixel_size, true,
-				       src_w != crtc_w || src_h != crtc_h);
 
 	stride_div = intel_fb_stride_alignment(dev, fb->modifier[0],
 					       fb->pixel_format);
@@ -300,8 +292,6 @@ skl_disable_plane(struct drm_plane *dplane, struct drm_crtc *crtc)
 
 	I915_WRITE(PLANE_SURF(pipe, plane), 0);
 	POSTING_READ(PLANE_SURF(pipe, plane));
-
-	intel_update_sprite_watermarks(dplane, crtc, 0, 0, 0, false, false);
 }
 
 static void
@@ -544,10 +534,6 @@ ivb_update_plane(struct drm_plane *plane, struct drm_crtc *crtc,
 	if (IS_HASWELL(dev) || IS_BROADWELL(dev))
 		sprctl |= SPRITE_PIPE_CSC_ENABLE;
 
-	intel_update_sprite_watermarks(plane, crtc, src_w, src_h, pixel_size,
-				       true,
-				       src_w != crtc_w || src_h != crtc_h);
-
 	/* Sizes are 0 based */
 	src_w--;
 	src_h--;
@@ -680,10 +666,6 @@ ilk_update_plane(struct drm_plane *plane, struct drm_crtc *crtc,
 
 	if (IS_GEN6(dev))
 		dvscntr |= DVS_TRICKLE_FEED_DISABLE; /* must disable */
-
-	intel_update_sprite_watermarks(plane, crtc, src_w, src_h,
-				       pixel_size, true,
-				       src_w != crtc_w || src_h != crtc_h);
 
 	/* Sizes are 0 based */
 	src_w--;
@@ -940,9 +922,6 @@ intel_commit_sprite_plane(struct drm_plane *plane,
 	struct drm_framebuffer *fb = state->base.fb;
 
 	crtc = crtc ? crtc : plane->crtc;
-
-	if (!crtc->state->active)
-		return;
 
 	if (state->visible) {
 		intel_plane->update_plane(plane, crtc, fb,

@@ -1331,20 +1331,25 @@ intel_hdmi_unset_edid(struct drm_connector *connector)
 }
 
 static bool
-intel_hdmi_set_edid(struct drm_connector *connector)
+intel_hdmi_set_edid(struct drm_connector *connector, bool force)
 {
 	struct drm_i915_private *dev_priv = to_i915(connector->dev);
 	struct intel_hdmi *intel_hdmi = intel_attached_hdmi(connector);
-	struct edid *edid;
+	struct intel_encoder *intel_encoder =
+		&hdmi_to_dig_port(intel_hdmi)->base;
+	enum intel_display_power_domain power_domain;
+	struct edid *edid = NULL;
 	bool connected = false;
 
-	intel_display_power_get(dev_priv, POWER_DOMAIN_GMBUS);
+	power_domain = intel_display_port_power_domain(intel_encoder);
+	intel_display_power_get(dev_priv, power_domain);
 
-	edid = drm_get_edid(connector,
-			    intel_gmbus_get_adapter(dev_priv,
-			    intel_hdmi->ddc_bus));
+	if (force)
+		edid = drm_get_edid(connector,
+				    intel_gmbus_get_adapter(dev_priv,
+				    intel_hdmi->ddc_bus));
 
-	intel_display_power_put(dev_priv, POWER_DOMAIN_GMBUS);
+	intel_display_power_put(dev_priv, power_domain);
 
 	to_intel_connector(connector)->detect_edid = edid;
 	if (edid && edid->input & DRM_EDID_INPUT_DIGITAL) {
@@ -1370,24 +1375,32 @@ static enum drm_connector_status
 intel_hdmi_detect(struct drm_connector *connector, bool force)
 {
 	enum drm_connector_status status;
+	struct intel_hdmi *intel_hdmi = intel_attached_hdmi(connector);
 	struct drm_i915_private *dev_priv = to_i915(connector->dev);
+	bool live_status = false;
+	unsigned int retry = 3;
 
 	DRM_DEBUG_KMS("[CONNECTOR:%d:%s]\n",
 		      connector->base.id, connector->name);
 
-	intel_display_power_get(dev_priv, POWER_DOMAIN_GMBUS);
+	while (!live_status && --retry) {
+		live_status = intel_digital_port_connected(dev_priv,
+				hdmi_to_dig_port(intel_hdmi));
+		mdelay(10);
+	}
+
+	if (!live_status)
+		DRM_DEBUG_KMS("Live status not up!");
 
 	intel_hdmi_unset_edid(connector);
 
-	if (intel_hdmi_set_edid(connector)) {
+	if (intel_hdmi_set_edid(connector, live_status)) {
 		struct intel_hdmi *intel_hdmi = intel_attached_hdmi(connector);
 
 		hdmi_to_dig_port(intel_hdmi)->base.type = INTEL_OUTPUT_HDMI;
 		status = connector_status_connected;
 	} else
 		status = connector_status_disconnected;
-
-	intel_display_power_put(dev_priv, POWER_DOMAIN_GMBUS);
 
 	return status;
 }
@@ -1405,7 +1418,7 @@ intel_hdmi_force(struct drm_connector *connector)
 	if (connector->status != connector_status_connected)
 		return;
 
-	intel_hdmi_set_edid(connector);
+	intel_hdmi_set_edid(connector, true);
 	hdmi_to_dig_port(intel_hdmi)->base.type = INTEL_OUTPUT_HDMI;
 }
 
@@ -1997,50 +2010,6 @@ intel_hdmi_add_properties(struct intel_hdmi *intel_hdmi, struct drm_connector *c
 	intel_hdmi->aspect_ratio = HDMI_PICTURE_ASPECT_NONE;
 }
 
-static u8 intel_hdmi_ddc_pin(struct drm_i915_private *dev_priv,
-			     enum port port)
-{
-	const struct ddi_vbt_port_info *info =
-		&dev_priv->vbt.ddi_port_info[port];
-	u8 ddc_pin;
-
-	if (info->alternate_ddc_pin) {
-		DRM_DEBUG_KMS("Using DDC pin 0x%x for port %c (VBT)\n",
-			      info->alternate_ddc_pin, port_name(port));
-		return info->alternate_ddc_pin;
-	}
-
-	switch (port) {
-	case PORT_B:
-		if (IS_BROXTON(dev_priv))
-			ddc_pin = GMBUS_PIN_1_BXT;
-		else
-			ddc_pin = GMBUS_PIN_DPB;
-		break;
-	case PORT_C:
-		if (IS_BROXTON(dev_priv))
-			ddc_pin = GMBUS_PIN_2_BXT;
-		else
-			ddc_pin = GMBUS_PIN_DPC;
-		break;
-	case PORT_D:
-		if (IS_CHERRYVIEW(dev_priv))
-			ddc_pin = GMBUS_PIN_DPD_CHV;
-		else
-			ddc_pin = GMBUS_PIN_DPD;
-		break;
-	default:
-		MISSING_CASE(port);
-		ddc_pin = GMBUS_PIN_DPB;
-		break;
-	}
-
-	DRM_DEBUG_KMS("Using DDC pin 0x%x for port %c (platform default)\n",
-		      ddc_pin, port_name(port));
-
-	return ddc_pin;
-}
-
 void intel_hdmi_init_connector(struct intel_digital_port *intel_dig_port,
 			       struct intel_connector *intel_connector)
 {
@@ -2050,9 +2019,7 @@ void intel_hdmi_init_connector(struct intel_digital_port *intel_dig_port,
 	struct drm_device *dev = intel_encoder->base.dev;
 	struct drm_i915_private *dev_priv = dev->dev_private;
 	enum port port = intel_dig_port->port;
-
-	DRM_DEBUG_KMS("Adding HDMI connector on port %c\n",
-		      port_name(port));
+	uint8_t alternate_ddc_pin;
 
 	drm_connector_init(dev, connector, &intel_hdmi_connector_funcs,
 			   DRM_MODE_CONNECTOR_HDMIA);
@@ -2062,31 +2029,62 @@ void intel_hdmi_init_connector(struct intel_digital_port *intel_dig_port,
 	connector->doublescan_allowed = 0;
 	connector->stereo_allowed = 1;
 
-	intel_hdmi->ddc_bus = intel_hdmi_ddc_pin(dev_priv, port);
-
 	switch (port) {
 	case PORT_B:
+		if (IS_BROXTON(dev_priv))
+			intel_hdmi->ddc_bus = GMBUS_PIN_1_BXT;
+		else
+			intel_hdmi->ddc_bus = GMBUS_PIN_DPB;
 		/*
 		 * On BXT A0/A1, sw needs to activate DDIA HPD logic and
 		 * interrupts to check the external panel connection.
 		 */
-		if (IS_BROXTON(dev_priv) && (INTEL_REVID(dev) < BXT_REVID_B0))
+		if (IS_BXT_REVID(dev_priv, 0, BXT_REVID_A1))
 			intel_encoder->hpd_pin = HPD_PORT_A;
 		else
 			intel_encoder->hpd_pin = HPD_PORT_B;
 		break;
 	case PORT_C:
+		if (IS_BROXTON(dev_priv))
+			intel_hdmi->ddc_bus = GMBUS_PIN_2_BXT;
+		else
+			intel_hdmi->ddc_bus = GMBUS_PIN_DPC;
 		intel_encoder->hpd_pin = HPD_PORT_C;
 		break;
 	case PORT_D:
+		if (WARN_ON(IS_BROXTON(dev_priv)))
+			intel_hdmi->ddc_bus = GMBUS_PIN_DISABLED;
+		else if (IS_CHERRYVIEW(dev_priv))
+			intel_hdmi->ddc_bus = GMBUS_PIN_DPD_CHV;
+		else
+			intel_hdmi->ddc_bus = GMBUS_PIN_DPD;
 		intel_encoder->hpd_pin = HPD_PORT_D;
 		break;
 	case PORT_E:
+		/* On SKL PORT E doesn't have seperate GMBUS pin
+		 *  We rely on VBT to set a proper alternate GMBUS pin. */
+		alternate_ddc_pin =
+			dev_priv->vbt.ddi_port_info[PORT_E].alternate_ddc_pin;
+		switch (alternate_ddc_pin) {
+		case DDC_PIN_B:
+			intel_hdmi->ddc_bus = GMBUS_PIN_DPB;
+			break;
+		case DDC_PIN_C:
+			intel_hdmi->ddc_bus = GMBUS_PIN_DPC;
+			break;
+		case DDC_PIN_D:
+			intel_hdmi->ddc_bus = GMBUS_PIN_DPD;
+			break;
+		default:
+			MISSING_CASE(alternate_ddc_pin);
+		}
 		intel_encoder->hpd_pin = HPD_PORT_E;
 		break;
+	case PORT_A:
+		intel_encoder->hpd_pin = HPD_PORT_A;
+		/* Internal port only for eDP. */
 	default:
-		MISSING_CASE(port);
-		return;
+		BUG();
 	}
 
 	if (IS_VALLEYVIEW(dev)) {

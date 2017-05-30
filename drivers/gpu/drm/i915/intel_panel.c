@@ -732,20 +732,6 @@ static void lpt_disable_backlight(struct intel_connector *connector)
 
 	intel_panel_actually_set_backlight(connector, 0);
 
-	/*
-	 * Although we don't support or enable CPU PWM with LPT/SPT based
-	 * systems, it may have been enabled prior to loading the
-	 * driver. Disable to avoid warnings on LCPLL disable.
-	 *
-	 * This needs rework if we need to add support for CPU PWM on PCH split
-	 * platforms.
-	 */
-	tmp = I915_READ(BLC_PWM_CPU_CTL2);
-	if (tmp & BLM_PWM_ENABLE) {
-		DRM_DEBUG_KMS("cpu backlight was enabled, disabling\n");
-		I915_WRITE(BLC_PWM_CPU_CTL2, tmp & ~BLM_PWM_ENABLE);
-	}
-
 	tmp = I915_READ(BLC_PWM_PCH_CTL1);
 	I915_WRITE(BLC_PWM_PCH_CTL1, tmp & ~BLM_PCH_PWM_ENABLE);
 }
@@ -1750,7 +1736,8 @@ intel_panel_init_backlight_funcs(struct intel_panel *panel)
 		panel->backlight.disable = bxt_disable_backlight;
 		panel->backlight.set = bxt_set_backlight;
 		panel->backlight.get = bxt_get_backlight;
-	} else if (HAS_PCH_LPT(dev) || HAS_PCH_SPT(dev)) {
+	} else if (HAS_PCH_LPT(dev) || HAS_PCH_SPT(dev) ||
+		HAS_PCH_KBP(dev)) {
 		panel->backlight.setup = lpt_setup_backlight;
 		panel->backlight.enable = lpt_enable_backlight;
 		panel->backlight.disable = lpt_disable_backlight;

@@ -758,6 +758,26 @@ static int i915_gem_seqno_info(struct seq_file *m, void *data)
 	return 0;
 }
 
+extern u64 i915_ring_0_idle;
+extern u64 i915_ring_0_busy;
+static int i915_ring_info(struct seq_file *m, void *data)
+{
+	struct drm_info_node *node = (struct drm_info_node *) m->private;
+	struct drm_device *dev = node->minor->dev;
+	int ret;
+
+	ret = mutex_lock_interruptible(&dev->struct_mutex);
+	if (ret)
+		return ret;
+
+	seq_printf(m, "i915_ring_0_idle %08lx busy %08lx\n",
+			(unsigned long) i915_ring_0_idle,
+			(unsigned long) i915_ring_0_busy);
+
+	mutex_unlock(&dev->struct_mutex);
+
+	return 0;
+}
 
 static int i915_interrupt_info(struct seq_file *m, void *data)
 {
@@ -1252,18 +1272,21 @@ static int i915_frequency_info(struct seq_file *m, void *unused)
 
 		max_freq = (IS_BROXTON(dev) ? rp_state_cap >> 0 :
 			    rp_state_cap >> 16) & 0xff;
-		max_freq *= (IS_SKYLAKE(dev) ? GEN9_FREQ_SCALER : 1);
+		max_freq *= (IS_SKYLAKE(dev) || IS_KABYLAKE(dev) ?
+			     GEN9_FREQ_SCALER : 1);
 		seq_printf(m, "Lowest (RPN) frequency: %dMHz\n",
 			   intel_gpu_freq(dev_priv, max_freq));
 
 		max_freq = (rp_state_cap & 0xff00) >> 8;
-		max_freq *= (IS_SKYLAKE(dev) ? GEN9_FREQ_SCALER : 1);
+		max_freq *= (IS_SKYLAKE(dev) || IS_KABYLAKE(dev) ?
+			     GEN9_FREQ_SCALER : 1);
 		seq_printf(m, "Nominal (RP1) frequency: %dMHz\n",
 			   intel_gpu_freq(dev_priv, max_freq));
 
 		max_freq = (IS_BROXTON(dev) ? rp_state_cap >> 16 :
 			    rp_state_cap >> 0) & 0xff;
-		max_freq *= (IS_SKYLAKE(dev) ? GEN9_FREQ_SCALER : 1);
+		max_freq *= (IS_SKYLAKE(dev) || IS_KABYLAKE(dev) ?
+			     GEN9_FREQ_SCALER : 1);
 		seq_printf(m, "Max non-overclocked (RP0) frequency: %dMHz\n",
 			   intel_gpu_freq(dev_priv, max_freq));
 		seq_printf(m, "Max overclocked frequency: %dMHz\n",
@@ -1801,7 +1824,7 @@ static int i915_ring_freq_table(struct seq_file *m, void *unused)
 	if (ret)
 		goto out;
 
-	if (IS_SKYLAKE(dev)) {
+	if (IS_SKYLAKE(dev) || IS_KABYLAKE(dev)) {
 		/* Convert GT frequency to 50 HZ units */
 		min_gpu_freq =
 			dev_priv->rps.min_freq_softlimit / GEN9_FREQ_SCALER;
@@ -1821,7 +1844,8 @@ static int i915_ring_freq_table(struct seq_file *m, void *unused)
 				       &ia_freq);
 		seq_printf(m, "%d\t\t%d\t\t\t\t%d\n",
 			   intel_gpu_freq(dev_priv, (gpu_freq *
-				(IS_SKYLAKE(dev) ? GEN9_FREQ_SCALER : 1))),
+				(IS_SKYLAKE(dev) || IS_KABYLAKE(dev) ?
+				 GEN9_FREQ_SCALER : 1))),
 			   ((ia_freq >> 0) & 0xff) * 100,
 			   ((ia_freq >> 8) & 0xff) * 100);
 	}
@@ -2402,6 +2426,12 @@ static int i915_guc_load_status_info(struct seq_file *m, void *data)
 		guc_fw->guc_fw_major_wanted, guc_fw->guc_fw_minor_wanted);
 	seq_printf(m, "\tversion found: %d.%d\n",
 		guc_fw->guc_fw_major_found, guc_fw->guc_fw_minor_found);
+	seq_printf(m, "\theader: offset is %d; size = %d\n",
+		guc_fw->header_offset, guc_fw->header_size);
+	seq_printf(m, "\tuCode: offset is %d; size = %d\n",
+		guc_fw->ucode_offset, guc_fw->ucode_size);
+	seq_printf(m, "\tRSA: offset is %d; size = %d\n",
+		guc_fw->rsa_offset, guc_fw->rsa_size);
 
 	tmp = I915_READ(GUC_STATUS);
 
@@ -2734,8 +2764,6 @@ static const char *power_domain_str(enum intel_display_power_domain domain)
 		return "AUX_C";
 	case POWER_DOMAIN_AUX_D:
 		return "AUX_D";
-	case POWER_DOMAIN_GMBUS:
-		return "GMBUS";
 	case POWER_DOMAIN_INIT:
 		return "INIT";
 	default:
@@ -2885,10 +2913,11 @@ static void intel_connector_info(struct seq_file *m,
 {
 	struct intel_connector *intel_connector = to_intel_connector(connector);
 	struct intel_encoder *intel_encoder = intel_connector->encoder;
+	struct intel_digital_port *dig_port = enc_to_dig_port(&intel_encoder->base);
 	struct drm_display_mode *mode;
 
-	seq_printf(m, "connector %d: type %s, status: %s\n",
-		   connector->base.id, connector->name,
+	seq_printf(m, "connector %d: type %s, port PORT_%c, status: %s\n",
+		   connector->base.id, connector->name, port_name(dig_port->port),
 		   drm_get_connector_status_name(connector->status));
 	if (connector->status == connector_status_connected) {
 		seq_printf(m, "\tname: %s\n", connector->display_info.name);
@@ -3100,9 +3129,11 @@ static int i915_wa_registers(struct seq_file *m, void *unused)
 {
 	int i;
 	int ret;
+	struct intel_engine_cs *ring;
 	struct drm_info_node *node = (struct drm_info_node *) m->private;
 	struct drm_device *dev = node->minor->dev;
 	struct drm_i915_private *dev_priv = dev->dev_private;
+	struct i915_workarounds *workarounds = &dev_priv->workarounds;
 
 	ret = mutex_lock_interruptible(&dev->struct_mutex);
 	if (ret)
@@ -3110,14 +3141,17 @@ static int i915_wa_registers(struct seq_file *m, void *unused)
 
 	intel_runtime_pm_get(dev_priv);
 
-	seq_printf(m, "Workarounds applied: %d\n", dev_priv->workarounds.count);
-	for (i = 0; i < dev_priv->workarounds.count; ++i) {
+	seq_printf(m, "Workarounds applied: %d\n", workarounds->count);
+	for_each_ring(ring, dev_priv, i)
+		seq_printf(m, "HW whitelist count for %s: %d\n",
+			   ring->name, workarounds->hw_whitelist_count[i]);
+	for (i = 0; i < workarounds->count; ++i) {
 		u32 addr, mask, value, read;
 		bool ok;
 
-		addr = dev_priv->workarounds.reg[i].addr;
-		mask = dev_priv->workarounds.reg[i].mask;
-		value = dev_priv->workarounds.reg[i].value;
+		addr = workarounds->reg[i].addr;
+		mask = workarounds->reg[i].mask;
+		value = workarounds->reg[i].value;
 		read = I915_READ(addr);
 		ok = (value & mask) == (read & mask);
 		seq_printf(m, "0x%X: 0x%08X, mask: 0x%08X, read: 0x%08x, status: %s\n",
@@ -5025,7 +5059,7 @@ static void gen9_sseu_device_status(struct drm_device *dev,
 
 		stat->slice_total++;
 
-		if (IS_SKYLAKE(dev))
+		if (IS_SKYLAKE(dev) || IS_KABYLAKE(dev))
 			ss_cnt = INTEL_INFO(dev)->subslice_per_slice;
 
 		for (ss = 0; ss < ss_max; ss++) {
@@ -5207,6 +5241,7 @@ static const struct drm_info_list i915_debugfs_list[] = {
 	{"i915_gem_seqno", i915_gem_seqno_info, 0},
 	{"i915_gem_fence_regs", i915_gem_fence_regs_info, 0},
 	{"i915_gem_interrupt", i915_interrupt_info, 0},
+	{"i915_ring_info", i915_ring_info, 0},
 	{"i915_gem_hws", i915_hws_info, 0, (void *)RCS},
 	{"i915_gem_hws_blt", i915_hws_info, 0, (void *)BCS},
 	{"i915_gem_hws_bsd", i915_hws_info, 0, (void *)VCS},

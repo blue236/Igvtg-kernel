@@ -56,6 +56,27 @@ static const u32 hpd_ivb[HPD_NUM_PINS] = {
 static const u32 hpd_bdw[HPD_NUM_PINS] = {
 	[HPD_PORT_A] = GEN8_PORT_DP_A_HOTPLUG,
 };
+#ifdef DRM_I915_VGT_SUPPORT
+#include "i915_vgpu.h"
+void i915_isr_wrapper(struct irq_work *work)
+{
+	struct drm_i915_private *dev_priv = container_of(work,
+				struct drm_i915_private, irq_work);
+
+	if (!vgt_can_process_irq())
+		return;
+
+	spin_lock(&dev_priv->irq_work_lock);
+	dev_priv->irq_ops.irq_handler(dev_priv->dev->pdev->irq, dev_priv->dev);
+	spin_unlock(&dev_priv->irq_work_lock);
+}
+
+void vgt_schedule_host_isr(struct drm_device *dev)
+{
+	struct drm_i915_private *dev_priv = dev->dev_private;
+	irq_work_queue(&dev_priv->irq_work);
+}
+#endif
 
 static const u32 hpd_ibx[HPD_NUM_PINS] = {
 	[HPD_CRT] = SDE_CRT_HOTPLUG,
@@ -749,7 +770,7 @@ static int __intel_get_crtc_scanline(struct intel_crtc *crtc)
 	 * problem.  We may need to extend this to include other platforms,
 	 * but so far testing only shows the problem on HSW.
 	 */
-	if (HAS_DDI(dev) && !position) {
+	if (IS_HASWELL(dev) && !position) {
 		int i, temp;
 
 		for (i = 0; i < 100; i++) {
@@ -996,51 +1017,68 @@ static void vlv_c0_read(struct drm_i915_private *dev_priv,
 	ei->media_c0 = I915_READ(VLV_MEDIA_C0_COUNT);
 }
 
+static bool vlv_c0_above(struct drm_i915_private *dev_priv,
+			 const struct intel_rps_ei *old,
+			 const struct intel_rps_ei *now,
+			 int threshold)
+{
+	u64 time, c0;
+	unsigned int mul = 100;
+
+	if (old->cz_clock == 0)
+		return false;
+
+	if (I915_READ(VLV_COUNTER_CONTROL) & VLV_COUNT_RANGE_HIGH)
+		mul <<= 8;
+
+	time = now->cz_clock - old->cz_clock;
+	time *= threshold * dev_priv->czclk_freq;
+
+	/* Workload can be split between render + media, e.g. SwapBuffers
+	 * being blitted in X after being rendered in mesa. To account for
+	 * this we need to combine both engines into our activity counter.
+	 */
+	c0 = now->render_c0 - old->render_c0;
+	c0 += now->media_c0 - old->media_c0;
+	c0 *= mul * VLV_CZ_CLOCK_TO_MILLI_SEC;
+
+	return c0 >= time;
+}
+
 void gen6_rps_reset_ei(struct drm_i915_private *dev_priv)
 {
-	memset(&dev_priv->rps.ei, 0, sizeof(dev_priv->rps.ei));
+	vlv_c0_read(dev_priv, &dev_priv->rps.down_ei);
+	dev_priv->rps.up_ei = dev_priv->rps.down_ei;
 }
 
 static u32 vlv_wa_c0_ei(struct drm_i915_private *dev_priv, u32 pm_iir)
 {
-	const struct intel_rps_ei *prev = &dev_priv->rps.ei;
 	struct intel_rps_ei now;
 	u32 events = 0;
 
-	if ((pm_iir & GEN6_PM_RP_UP_EI_EXPIRED) == 0)
+	if ((pm_iir & (GEN6_PM_RP_DOWN_EI_EXPIRED | GEN6_PM_RP_UP_EI_EXPIRED)) == 0)
 		return 0;
 
 	vlv_c0_read(dev_priv, &now);
 	if (now.cz_clock == 0)
 		return 0;
 
-	if (prev->cz_clock) {
-		u64 time, c0;
-		unsigned int mul;
-
-		mul = VLV_CZ_CLOCK_TO_MILLI_SEC * 100; /* scale to threshold% */
-		if (I915_READ(VLV_COUNTER_CONTROL) & VLV_COUNT_RANGE_HIGH)
-			mul <<= 8;
-
-		time = now.cz_clock - prev->cz_clock;
-		time *= dev_priv->czclk_freq;
-
-		/* Workload can be split between render + media,
-		 * e.g. SwapBuffers being blitted in X after being rendered in
-		 * mesa. To account for this we need to combine both engines
-		 * into our activity counter.
-		 */
-		c0 = now.render_c0 - prev->render_c0;
-		c0 += now.media_c0 - prev->media_c0;
-		c0 *= mul;
-
-		if (c0 > time * dev_priv->rps.up_threshold)
-			events = GEN6_PM_RP_UP_THRESHOLD;
-		else if (c0 < time * dev_priv->rps.down_threshold)
-			events = GEN6_PM_RP_DOWN_THRESHOLD;
+	if (pm_iir & GEN6_PM_RP_DOWN_EI_EXPIRED) {
+		if (!vlv_c0_above(dev_priv,
+				  &dev_priv->rps.down_ei, &now,
+				  dev_priv->rps.down_threshold))
+			events |= GEN6_PM_RP_DOWN_THRESHOLD;
+		dev_priv->rps.down_ei = now;
 	}
 
-	dev_priv->rps.ei = now;
+	if (pm_iir & GEN6_PM_RP_UP_EI_EXPIRED) {
+		if (vlv_c0_above(dev_priv,
+				 &dev_priv->rps.up_ei, &now,
+				 dev_priv->rps.up_threshold))
+			events |= GEN6_PM_RP_UP_THRESHOLD;
+		dev_priv->rps.up_ei = now;
+	}
+
 	return events;
 }
 
@@ -1275,70 +1313,69 @@ static void snb_gt_irq_handler(struct drm_device *dev,
 		ivybridge_parity_error_irq_handler(dev, gt_iir);
 }
 
+static __always_inline void
+gen8_cs_irq_handler(struct intel_engine_cs *ring, u32 iir, int test_shift)
+{
+	if (iir & (GT_RENDER_USER_INTERRUPT << test_shift))
+		notify_ring(ring);
+	if (iir & (GT_CONTEXT_SWITCH_INTERRUPT << test_shift))
+		intel_lrc_irq_handler(ring);
+}
+
 static irqreturn_t gen8_gt_irq_handler(struct drm_i915_private *dev_priv,
 				       u32 master_ctl)
 {
 	irqreturn_t ret = IRQ_NONE;
 
 	if (master_ctl & (GEN8_GT_RCS_IRQ | GEN8_GT_BCS_IRQ)) {
-		u32 tmp = I915_READ_FW(GEN8_GT_IIR(0));
-		if (tmp) {
-			I915_WRITE_FW(GEN8_GT_IIR(0), tmp);
+		u32 iir = I915_READ_FW(GEN8_GT_IIR(0));
+		if (iir) {
+			I915_WRITE_FW(GEN8_GT_IIR(0), iir);
 			ret = IRQ_HANDLED;
 
-			if (tmp & (GT_CONTEXT_SWITCH_INTERRUPT << GEN8_RCS_IRQ_SHIFT))
-				intel_lrc_irq_handler(&dev_priv->ring[RCS]);
-			if (tmp & (GT_RENDER_USER_INTERRUPT << GEN8_RCS_IRQ_SHIFT))
-				notify_ring(&dev_priv->ring[RCS]);
+			gen8_cs_irq_handler(&dev_priv->ring[RCS],
+					iir, GEN8_RCS_IRQ_SHIFT);
 
-			if (tmp & (GT_CONTEXT_SWITCH_INTERRUPT << GEN8_BCS_IRQ_SHIFT))
-				intel_lrc_irq_handler(&dev_priv->ring[BCS]);
-			if (tmp & (GT_RENDER_USER_INTERRUPT << GEN8_BCS_IRQ_SHIFT))
-				notify_ring(&dev_priv->ring[BCS]);
+			gen8_cs_irq_handler(&dev_priv->ring[BCS],
+					iir, GEN8_BCS_IRQ_SHIFT);
 		} else
 			DRM_ERROR("The master control interrupt lied (GT0)!\n");
 	}
 
 	if (master_ctl & (GEN8_GT_VCS1_IRQ | GEN8_GT_VCS2_IRQ)) {
-		u32 tmp = I915_READ_FW(GEN8_GT_IIR(1));
-		if (tmp) {
-			I915_WRITE_FW(GEN8_GT_IIR(1), tmp);
+		u32 iir = I915_READ_FW(GEN8_GT_IIR(1));
+		if (iir) {
+			I915_WRITE_FW(GEN8_GT_IIR(1), iir);
 			ret = IRQ_HANDLED;
 
-			if (tmp & (GT_CONTEXT_SWITCH_INTERRUPT << GEN8_VCS1_IRQ_SHIFT))
-				intel_lrc_irq_handler(&dev_priv->ring[VCS]);
-			if (tmp & (GT_RENDER_USER_INTERRUPT << GEN8_VCS1_IRQ_SHIFT))
-				notify_ring(&dev_priv->ring[VCS]);
+			gen8_cs_irq_handler(&dev_priv->ring[VCS],
+					iir, GEN8_VCS1_IRQ_SHIFT);
 
-			if (tmp & (GT_CONTEXT_SWITCH_INTERRUPT << GEN8_VCS2_IRQ_SHIFT))
-				intel_lrc_irq_handler(&dev_priv->ring[VCS2]);
-			if (tmp & (GT_RENDER_USER_INTERRUPT << GEN8_VCS2_IRQ_SHIFT))
-				notify_ring(&dev_priv->ring[VCS2]);
+			gen8_cs_irq_handler(&dev_priv->ring[VCS2],
+					iir, GEN8_VCS2_IRQ_SHIFT);
 		} else
 			DRM_ERROR("The master control interrupt lied (GT1)!\n");
 	}
 
 	if (master_ctl & GEN8_GT_VECS_IRQ) {
-		u32 tmp = I915_READ_FW(GEN8_GT_IIR(3));
-		if (tmp) {
-			I915_WRITE_FW(GEN8_GT_IIR(3), tmp);
+		u32 iir = I915_READ_FW(GEN8_GT_IIR(3));
+		if (iir) {
+			I915_WRITE_FW(GEN8_GT_IIR(3), iir);
 			ret = IRQ_HANDLED;
 
-			if (tmp & (GT_CONTEXT_SWITCH_INTERRUPT << GEN8_VECS_IRQ_SHIFT))
-				intel_lrc_irq_handler(&dev_priv->ring[VECS]);
-			if (tmp & (GT_RENDER_USER_INTERRUPT << GEN8_VECS_IRQ_SHIFT))
-				notify_ring(&dev_priv->ring[VECS]);
+			gen8_cs_irq_handler(&dev_priv->ring[VECS],
+					iir, GEN8_VECS_IRQ_SHIFT);
 		} else
 			DRM_ERROR("The master control interrupt lied (GT3)!\n");
 	}
 
 	if (master_ctl & GEN8_GT_PM_IRQ) {
-		u32 tmp = I915_READ_FW(GEN8_GT_IIR(2));
-		if (tmp & dev_priv->pm_rps_events) {
+		u32 iir = I915_READ_FW(GEN8_GT_IIR(2));
+		if (iir & dev_priv->pm_rps_events) {
 			I915_WRITE_FW(GEN8_GT_IIR(2),
-				      tmp & dev_priv->pm_rps_events);
+				      iir & dev_priv->pm_rps_events);
 			ret = IRQ_HANDLED;
-			gen6_rps_irq_handler(dev_priv, tmp);
+			gen6_rps_irq_handler(dev_priv, iir);
 		} else
 			DRM_ERROR("The master control interrupt lied (PM)!\n");
 	}
@@ -2335,7 +2372,7 @@ static irqreturn_t gen8_irq_handler(int irq, void *arg)
 			I915_WRITE(SDEIIR, pch_iir);
 			ret = IRQ_HANDLED;
 
-			if (HAS_PCH_SPT(dev_priv))
+			if (HAS_PCH_SPT(dev_priv) || HAS_PCH_KBP(dev_priv))
 				spt_irq_handler(dev, pch_iir);
 			else
 				cpt_irq_handler(dev, pch_iir);
@@ -2946,6 +2983,9 @@ static void i915_hangcheck_elapsed(struct work_struct *work)
 #define BUSY 1
 #define KICK 5
 #define HUNG 20
+#ifdef DRM_I915_VGT_SUPPORT
+#define ACTIVE_DECAY 15
+#endif
 
 	if (!i915.enable_hangcheck)
 		return;
@@ -3021,8 +3061,15 @@ static void i915_hangcheck_elapsed(struct work_struct *work)
 			/* Gradually reduce the count so that we catch DoS
 			 * attempts across multiple batches.
 			 */
-			if (ring->hangcheck.score > 0)
-				ring->hangcheck.score--;
+#ifdef DRM_I915_VGT_SUPPORT
+            if (ring->hangcheck.score > 0)
+                ring->hangcheck.score -= ACTIVE_DECAY;
+            if (ring->hangcheck.score < 0)
+                ring->hangcheck.score = 0;
+#else
+            if (ring->hangcheck.score > 0)
+                ring->hangcheck.score--;
+#endif
 
 			ring->hangcheck.acthd = ring->hangcheck.max_acthd = 0;
 		}
@@ -3041,8 +3088,14 @@ static void i915_hangcheck_elapsed(struct work_struct *work)
 		}
 	}
 
-	if (rings_hung)
-		return i915_handle_error(dev, true, "Ring hung");
+	if (rings_hung) {
+#ifdef DRM_I915_VGT_SUPPORT
+		if (i915_host_mediate && vgt_handle_dom0_device_reset())
+			return;
+#endif
+		i915_handle_error(dev, true, "Ring hung");
+		return;
+	}
 
 	if (busy_count)
 		/* Reset timer case chip hangs without another request
@@ -3410,6 +3463,15 @@ static int ironlake_irq_postinstall(struct drm_device *dev)
 		extra_mask = (DE_PIPEC_VBLANK_IVB | DE_PIPEB_VBLANK_IVB |
 			      DE_PIPEA_VBLANK_IVB | DE_ERR_INT_IVB |
 			      DE_DP_A_HOTPLUG_IVB);
+
+		I915_WRITE(GEN7_ERR_INT, I915_READ(GEN7_ERR_INT));
+
+		/*
+		 * Do not enable ERR_INT for VGT temporarily,
+		 * as VGT doesn't handle this.
+		 */
+		if (intel_vgpu_active(dev))
+			extra_mask &= ~DE_ERR_INT_IVB;
 	} else {
 		display_mask = (DE_MASTER_IRQ_CONTROL | DE_GSE | DE_PCH_EVENT |
 				DE_PLANEA_FLIP_DONE | DE_PLANEB_FLIP_DONE |
@@ -4356,6 +4418,56 @@ static void i965_irq_uninstall(struct drm_device * dev)
 	I915_WRITE(IIR, I915_READ(IIR));
 }
 
+#ifdef CONFIG_I915_VGT
+void *i915_drm_to_pgt(struct drm_device *dev)
+{
+	struct drm_i915_private *dev_priv = dev->dev_private;
+	return dev_priv->pgt;
+}
+
+static void vgt_irq_preinstall(struct drm_device *dev)
+{
+	struct drm_i915_private *dev_priv = dev->dev_private;
+
+	dev_priv->pgt = vgt_init_irq(dev->pdev, dev);
+	if (!dev_priv->pgt) {
+		DRM_DEBUG_DRIVER("vgt_init_irq failed, turn vgt off\n");
+		i915_host_mediate = false;
+
+		dev->driver->irq_handler = dev_priv->irq_ops.irq_handler;
+		dev->driver->irq_preinstall = dev_priv->irq_ops.irq_preinstall;
+		dev->driver->irq_postinstall = dev_priv->irq_ops.irq_postinstall;
+		dev->driver->irq_uninstall = dev_priv->irq_ops.irq_uninstall;
+
+		/* still call it for this time */
+		dev_priv->irq_ops.irq_preinstall(dev);
+
+		return;
+	}
+
+	init_irq_work(&dev_priv->irq_work, i915_isr_wrapper);
+	spin_lock_init(&dev_priv->irq_work_lock);
+
+	dev_priv->irq_ops.irq_preinstall(dev);
+}
+
+static int vgt_irq_postinstall(struct drm_device *dev)
+{
+	struct drm_i915_private *dev_priv = dev->dev_private;
+	return dev_priv->irq_ops.irq_postinstall(dev);
+}
+
+static void vgt_irq_uninstall(struct drm_device *dev)
+{
+	struct drm_i915_private *dev_priv = dev->dev_private;
+	irq_work_sync(&dev_priv->irq_work);
+
+	dev_priv->irq_ops.irq_uninstall(dev);
+
+	vgt_fini_irq(dev->pdev);
+}
+#endif
+
 /**
  * intel_irq_init - initializes irq support
  * @dev_priv: i915 device instance
@@ -4375,7 +4487,7 @@ void intel_irq_init(struct drm_i915_private *dev_priv)
 	/* Let's track the enabled rps events */
 	if (IS_VALLEYVIEW(dev_priv) && !IS_CHERRYVIEW(dev_priv))
 		/* WaGsvRC0ResidencyMethod:vlv */
-		dev_priv->pm_rps_events = GEN6_PM_RP_UP_EI_EXPIRED;
+		dev_priv->pm_rps_events = GEN6_PM_RP_DOWN_EI_EXPIRED | GEN6_PM_RP_UP_EI_EXPIRED;
 	else
 		dev_priv->pm_rps_events = GEN6_PM_RPS_EVENTS;
 
@@ -4431,7 +4543,7 @@ void intel_irq_init(struct drm_i915_private *dev_priv)
 		dev->driver->disable_vblank = gen8_disable_vblank;
 		if (IS_BROXTON(dev))
 			dev_priv->display.hpd_irq_setup = bxt_hpd_irq_setup;
-		else if (HAS_PCH_SPT(dev))
+		else if (HAS_PCH_SPT(dev) || HAS_PCH_KBP(dev))
 			dev_priv->display.hpd_irq_setup = spt_hpd_irq_setup;
 		else
 			dev_priv->display.hpd_irq_setup = ilk_hpd_irq_setup;
@@ -4465,6 +4577,22 @@ void intel_irq_init(struct drm_i915_private *dev_priv)
 		dev->driver->enable_vblank = i915_enable_vblank;
 		dev->driver->disable_vblank = i915_disable_vblank;
 	}
+
+#ifdef CONFIG_I915_VGT
+	if (i915_host_mediate) {
+		/* save the original irq ops */
+		dev_priv->irq_ops.irq_handler = dev->driver->irq_handler;
+		dev_priv->irq_ops.irq_preinstall = dev->driver->irq_preinstall;
+		dev_priv->irq_ops.irq_postinstall = dev->driver->irq_postinstall;
+		dev_priv->irq_ops.irq_uninstall = dev->driver->irq_uninstall;
+
+		/* let drm take vgt as hardware interrupt handler */
+		dev->driver->irq_handler = vgt_interrupt;
+		dev->driver->irq_preinstall = vgt_irq_preinstall;
+		dev->driver->irq_postinstall = vgt_irq_postinstall;
+		dev->driver->irq_uninstall = vgt_irq_uninstall;
+	}
+#endif
 }
 
 /**

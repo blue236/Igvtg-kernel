@@ -141,6 +141,8 @@ static void i915_gem_context_clean(struct intel_context *ctx)
 	if (!ppgtt)
 		return;
 
+	WARN_ON(!list_empty(&ppgtt->base.active_list));
+
 	list_for_each_entry_safe(vma, next, &ppgtt->base.inactive_list,
 				 mm_list) {
 		if (WARN_ON(__i915_vma_unbind_no_wait(vma)))
@@ -340,10 +342,6 @@ void i915_gem_context_reset(struct drm_device *dev)
 			i915_gem_context_unreference(lctx);
 			ring->last_context = NULL;
 		}
-
-		/* Force the GPU state to be reinitialised on enabling */
-		if (ring->default_context)
-			ring->default_context->legacy_hw_ctx.initialized = false;
 	}
 }
 
@@ -352,6 +350,9 @@ int i915_gem_context_init(struct drm_device *dev)
 	struct drm_i915_private *dev_priv = dev->dev_private;
 	struct intel_context *ctx;
 	int i;
+
+	if (i915.ctx_switch == false)
+		return 0;
 
 	/* Init should only be called once per module load. Eventually the
 	 * restriction on the context_disabled check can be loosened. */
@@ -538,6 +539,9 @@ mi_set_context(struct drm_i915_gem_request *req, u32 hw_flags)
 	else if (INTEL_INFO(ring->dev)->gen < 8)
 		flags |= (MI_SAVE_EXT_STATE_EN | MI_RESTORE_EXT_STATE_EN);
 
+	if ((!IS_HASWELL(ring->dev) || intel_vgpu_active(ring->dev)) && INTEL_INFO(ring->dev)->gen < 8)
+		flags |= (MI_SAVE_EXT_STATE_EN | MI_RESTORE_EXT_STATE_EN);
+
 
 	len = 4;
 	if (INTEL_INFO(ring->dev)->gen >= 7)
@@ -712,7 +716,7 @@ static int do_switch(struct drm_i915_gem_request *req)
 	if (ret)
 		goto unpin_out;
 
-	if (!to->legacy_hw_ctx.initialized || i915_gem_context_is_default(to)) {
+	if (!to->legacy_hw_ctx.initialized) {
 		hw_flags |= MI_RESTORE_INHIBIT;
 		/* NB: If we inhibit the restore, the context is not allowed to
 		 * die because future work may end up depending on valid address
@@ -926,6 +930,14 @@ int i915_gem_context_getparam_ioctl(struct drm_device *dev, void *data,
 		break;
 	case I915_CONTEXT_PARAM_NO_ZEROMAP:
 		args->value = ctx->flags & CONTEXT_NO_ZEROMAP;
+		break;
+	case I915_CONTEXT_PARAM_GTT_SIZE:
+		if (ctx->ppgtt)
+			args->value = ctx->ppgtt->base.total;
+		else if (to_i915(dev)->mm.aliasing_ppgtt)
+			args->value = to_i915(dev)->mm.aliasing_ppgtt->base.total;
+		else
+			args->value = to_i915(dev)->gtt.base.total;
 		break;
 	default:
 		ret = -EINVAL;

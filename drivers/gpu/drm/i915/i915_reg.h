@@ -135,6 +135,9 @@
 #define  GEN6_GRDOM_RENDER		(1 << 1)
 #define  GEN6_GRDOM_MEDIA		(1 << 2)
 #define  GEN6_GRDOM_BLT			(1 << 3)
+#define  GEN6_GRDOM_VECS		(1 << 4)
+#define  GEN8_GRDOM_MEDIA2		(1 << 7)
+
 
 #define RING_PP_DIR_BASE(ring)		((ring)->mmio_base+0x228)
 #define RING_PP_DIR_BASE_READ(ring)	((ring)->mmio_base+0x518)
@@ -804,31 +807,31 @@ enum skl_disp_power_wells {
  *
  * Note: DDI0 is digital port B, DD1 is digital port C, and DDI2 is
  * digital port D (CHV) or port A (BXT).
- */
-/*
- * Dual channel PHY (VLV/CHV/BXT)
- * ---------------------------------
- * |      CH0      |      CH1      |
- * |  CMN/PLL/REF  |  CMN/PLL/REF  |
- * |---------------|---------------| Display PHY
- * | PCS01 | PCS23 | PCS01 | PCS23 |
- * |-------|-------|-------|-------|
- * |TX0|TX1|TX2|TX3|TX0|TX1|TX2|TX3|
- * ---------------------------------
- * |     DDI0      |     DDI1      | DP/HDMI ports
- * ---------------------------------
  *
- * Single channel PHY (CHV/BXT)
- * -----------------
- * |      CH0      |
- * |  CMN/PLL/REF  |
- * |---------------| Display PHY
- * | PCS01 | PCS23 |
- * |-------|-------|
- * |TX0|TX1|TX2|TX3|
- * -----------------
- * |     DDI2      | DP/HDMI port
- * -----------------
+ *
+ *     Dual channel PHY (VLV/CHV/BXT)
+ *     ---------------------------------
+ *     |      CH0      |      CH1      |
+ *     |  CMN/PLL/REF  |  CMN/PLL/REF  |
+ *     |---------------|---------------| Display PHY
+ *     | PCS01 | PCS23 | PCS01 | PCS23 |
+ *     |-------|-------|-------|-------|
+ *     |TX0|TX1|TX2|TX3|TX0|TX1|TX2|TX3|
+ *     ---------------------------------
+ *     |     DDI0      |     DDI1      | DP/HDMI ports
+ *     ---------------------------------
+ *
+ *     Single channel PHY (CHV/BXT)
+ *     -----------------
+ *     |      CH0      |
+ *     |  CMN/PLL/REF  |
+ *     |---------------| Display PHY
+ *     | PCS01 | PCS23 |
+ *     |-------|-------|
+ *     |TX0|TX1|TX2|TX3|
+ *     -----------------
+ *     |     DDI2      | DP/HDMI port
+ *     -----------------
  */
 #define DPIO_DEVFN			0
 
@@ -1583,7 +1586,13 @@ enum skl_disp_power_wells {
 #define   RING_WAIT		(1<<11) /* gen3+, PRBx_CTL */
 #define   RING_WAIT_SEMAPHORE	(1<<10) /* gen6+ */
 
+#define RING_FORCE_TO_NONPRIV(base, i) (((base)+0x4D0) + (i)*4)
+#define   RING_MAX_NONPRIV_SLOTS  12
+
 #define GEN7_TLB_RD_ADDR	0x4700
+
+#define GAMT_CHKN_BIT_REG	0x4ab8
+#define   GAMT_CHKN_DISABLE_DYNAMIC_CREDIT_SHARING	(1<<28)
 
 #if 0
 #define PRB0_TAIL	0x02030
@@ -1846,6 +1855,9 @@ enum skl_disp_power_wells {
 #define MI_STATE	0x020e4 /* gen2 only */
 #define   MI_AGPBUSY_INT_EN			(1 << 1) /* 85x only */
 #define   MI_AGPBUSY_830_MODE			(1 << 0) /* 85x only */
+
+#define GEN8_FF_SLICE_CS_CHICKEN2		0x20e4
+#define   GEN8_THREAD_GROUP_PREEMPTION		(1<<1)
 
 #define CACHE_MODE_0	0x02120 /* 915+ only */
 #define   CM0_PIPELINED_RENDER_FLUSH_DISABLE (1<<8)
@@ -2838,14 +2850,7 @@ enum skl_disp_power_wells {
 #define GEN6_RP_STATE_CAP	(MCHBAR_MIRROR_BASE_SNB + 0x5998)
 #define BXT_RP_STATE_CAP        0x138170
 
-/*
- * Make these a multiple of magic 25 to avoid SNB (eg. Dell XPS
- * 8300) freezing up around GPU hangs. Looks as if even
- * scheduling/timer interrupts start misbehaving if the RPS
- * EI/thresholds are "bad", leading to a very sluggish or even
- * frozen machine.
- */
-#define INTERVAL_1_28_US(us)	roundup(((us) * 100) >> 7, 25)
+#define INTERVAL_1_28_US(us)	(((us) * 100) >> 7)
 #define INTERVAL_1_33_US(us)	(((us) * 3)   >> 2)
 #define INTERVAL_0_833_US(us)	(((us) * 6) / 5)
 #define GT_INTERVAL_FROM_US(dev_priv, us) (IS_GEN9(dev_priv) ? \
@@ -3240,20 +3245,19 @@ enum skl_disp_power_wells {
 
 #define PORT_HOTPLUG_STAT	(dev_priv->info.display_mmio_offset + 0x61114)
 /*
- * HDMI/DP bits are g4x+
+ * HDMI/DP bits are gen4+
  *
  * WARNING: Bspec for hpd status bits on gen4 seems to be completely confused.
  * Please check the detailed lore in the commit message for for experimental
  * evidence.
  */
-/* Bspec says GM45 should match G4X/VLV/CHV, but reality disagrees */
-#define   PORTD_HOTPLUG_LIVE_STATUS_GM45	(1 << 29)
-#define   PORTC_HOTPLUG_LIVE_STATUS_GM45	(1 << 28)
-#define   PORTB_HOTPLUG_LIVE_STATUS_GM45	(1 << 27)
-/* G4X/VLV/CHV DP/HDMI bits again match Bspec */
-#define   PORTD_HOTPLUG_LIVE_STATUS_G4X		(1 << 27)
+#define   PORTD_HOTPLUG_LIVE_STATUS_G4X		(1 << 29)
 #define   PORTC_HOTPLUG_LIVE_STATUS_G4X		(1 << 28)
-#define   PORTB_HOTPLUG_LIVE_STATUS_G4X		(1 << 29)
+#define   PORTB_HOTPLUG_LIVE_STATUS_G4X		(1 << 27)
+/* VLV DP/HDMI bits again match Bspec */
+#define   PORTD_HOTPLUG_LIVE_STATUS_VLV		(1 << 27)
+#define   PORTC_HOTPLUG_LIVE_STATUS_VLV		(1 << 28)
+#define   PORTB_HOTPLUG_LIVE_STATUS_VLV		(1 << 29)
 #define   PORTD_HOTPLUG_INT_STATUS		(3 << 21)
 #define   PORTD_HOTPLUG_INT_LONG_PULSE		(2 << 21)
 #define   PORTD_HOTPLUG_INT_SHORT_PULSE		(1 << 21)
@@ -5889,6 +5893,7 @@ enum skl_disp_power_wells {
 #define CHICKEN_PAR1_1		0x42080
 #define  DPA_MASK_VBLANK_SRD	(1 << 15)
 #define  FORCE_ARB_IDLE_PLANES	(1 << 14)
+#define  SKL_EDP_PSR_FIX_RDWRAP	(1 << 3)
 
 #define _CHICKEN_PIPESL_1_A	0x420b0
 #define _CHICKEN_PIPESL_1_B	0x420b4
@@ -5916,15 +5921,25 @@ enum skl_disp_power_wells {
 #define SKL_DFSM_CDCLK_LIMIT_540	(1 << 23)
 #define SKL_DFSM_CDCLK_LIMIT_450	(2 << 23)
 #define SKL_DFSM_CDCLK_LIMIT_337_5	(3 << 23)
+#define SKL_DFSM_PIPE_A_DISABLE		(1 << 30)
+#define SKL_DFSM_PIPE_B_DISABLE		(1 << 21)
+#define SKL_DFSM_PIPE_C_DISABLE		(1 << 28)
+
+#define GEN7_FF_SLICE_CS_CHICKEN1	0x20e0
+#define   GEN9_FFSC_PERCTX_PREEMPT_CTRL	(1<<14)
 
 #define FF_SLICE_CS_CHICKEN2			0x20e4
 #define  GEN9_TSG_BARRIER_ACK_DISABLE		(1<<8)
+
+#define GEN9_CTX_PREEMPT_REG		0x2248
+#define GEN8_CS_CHICKEN1		0x2580
 
 /* GEN7 chicken */
 #define GEN7_COMMON_SLICE_CHICKEN1		0x7010
 # define GEN7_CSC1_RHWO_OPT_DISABLE_IN_RCC	((1<<10) | (1<<26))
 # define GEN9_RHWO_OPTIMIZATION_DISABLE		(1<<14)
 #define COMMON_SLICE_CHICKEN2			0x7014
+# define GEN8_SBE_DISABLE_REPLAY_BUF_OPTIMIZATION (1<<8)
 # define GEN8_CSC2_SBE_VUE_CACHE_CONSERVATIVE	(1<<0)
 
 #define HIZ_CHICKEN					0x7018
@@ -5955,6 +5970,7 @@ enum skl_disp_power_wells {
 #define GEN8_L3SQCREG4				0xb118
 #define  GEN8_LQSC_RO_PERF_DIS			(1<<27)
 #define  GEN8_LQSC_FLUSH_COHERENT_LINES		(1<<21)
+#define  GEN8_PIPELINE_FLUSH_COHERENT_LINES	(1<<21)
 
 /* GEN8 chicken */
 #define HDC_CHICKEN0				0x7300
@@ -5964,6 +5980,8 @@ enum skl_disp_power_wells {
 #define  HDC_FORCE_CONTEXT_SAVE_RESTORE_NON_COHERENT	(1<<5)
 #define  HDC_FORCE_NON_COHERENT			(1<<4)
 #define  HDC_BARRIER_PERFORMANCE_DISABLE	(1<<10)
+
+#define GEN8_HDC_CHICKEN1			0x7304
 
 /* GEN9 chicken */
 #define SLICE_ECO_CHICKEN0			0x7308
@@ -6745,6 +6763,7 @@ enum skl_disp_power_wells {
 #define    EDRAM_ENABLED			0x1
 
 #define GEN6_UCGCTL1				0x9400
+# define GEN6_GAMUNIT_CLOCK_GATE_DISABLE		(1 << 22)
 # define GEN6_EU_TCUNIT_CLOCK_GATE_DISABLE		(1 << 16)
 # define GEN6_BLBUNIT_CLOCK_GATE_DISABLE		(1 << 5)
 # define GEN6_CSUNIT_CLOCK_GATE_DISABLE			(1 << 7)
@@ -6761,6 +6780,7 @@ enum skl_disp_power_wells {
 
 #define GEN7_UCGCTL4				0x940c
 #define  GEN7_L3BANK2X_CLOCK_GATE_DISABLE	(1<<25)
+#define  GEN8_EU_GAUNIT_CLOCK_GATE_DISABLE	(1<<14)
 
 #define GEN6_RCGCTL1				0x9410
 #define GEN6_RCGCTL2				0x9414
@@ -6999,6 +7019,7 @@ enum skl_disp_power_wells {
 #define   GEN9_CCS_TLB_PREFETCH_ENABLE	(1<<3)
 
 #define GEN8_ROW_CHICKEN		0xe4f0
+#define   FLOW_CONTROL_ENABLE		(1<<15)
 #define   PARTIAL_INSTRUCTION_SHOOTDOWN_DISABLE	(1<<8)
 #define   STALL_DOP_GATING_DISABLE		(1<<5)
 
@@ -7020,6 +7041,7 @@ enum skl_disp_power_wells {
 
 #define GEN9_HALF_SLICE_CHICKEN7	0xe194
 #define   GEN9_ENABLE_YV12_BUGFIX	(1<<4)
+#define   GEN9_ENABLE_GPGPU_PREEMPTION	(1<<2)
 
 /* Audio */
 #define G4X_AUD_VID_DID			(dev_priv->info.display_mmio_offset + 0x62020)
@@ -7357,8 +7379,6 @@ enum skl_disp_power_wells {
 /* For each transcoder, we need to select the corresponding port clock */
 #define  TRANS_CLK_SEL_DISABLED		(0x0<<29)
 #define  TRANS_CLK_SEL_PORT(x)		(((x)+1)<<29)
-
-#define CDCLK_FREQ			0x46200
 
 #define TRANSA_MSA_MISC			0x60410
 #define TRANSB_MSA_MISC			0x61410

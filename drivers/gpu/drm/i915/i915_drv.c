@@ -40,6 +40,8 @@
 #include <linux/pm_runtime.h>
 #include <drm/drm_crtc_helper.h>
 
+bool i915_host_mediate __read_mostly = false;
+
 static struct drm_driver driver;
 
 #define GEN_DEFAULT_PIPEOFFSETS \
@@ -383,10 +385,39 @@ static const struct intel_device_info intel_skylake_gt3_info = {
 
 static const struct intel_device_info intel_broxton_info = {
 	.is_preliminary = 1,
+	.is_broxton = 1,
 	.gen = 9,
 	.need_gfx_hws = 1, .has_hotplug = 1,
 	.ring_mask = RENDER_RING | BSD_RING | BLT_RING | VEBOX_RING,
 	.num_pipes = 3,
+	.has_ddi = 1,
+	.has_fpga_dbg = 1,
+	.has_fbc = 1,
+	GEN_DEFAULT_PIPEOFFSETS,
+	IVB_CURSOR_OFFSETS,
+};
+
+static const struct intel_device_info intel_kabylake_info = {
+	.is_kabylake = 1,
+	.gen = 9,
+	.num_pipes = 3,
+	.need_gfx_hws = 1, .has_hotplug = 1,
+	.ring_mask = RENDER_RING | BSD_RING | BLT_RING | VEBOX_RING,
+	.has_llc = 1,
+	.has_ddi = 1,
+	.has_fpga_dbg = 1,
+	.has_fbc = 1,
+	GEN_DEFAULT_PIPEOFFSETS,
+	IVB_CURSOR_OFFSETS,
+};
+
+static const struct intel_device_info intel_kabylake_gt3_info = {
+	.is_kabylake = 1,
+	.gen = 9,
+	.num_pipes = 3,
+	.need_gfx_hws = 1, .has_hotplug = 1,
+	.ring_mask = RENDER_RING | BSD_RING | BLT_RING | VEBOX_RING | BSD2_RING,
+	.has_llc = 1,
 	.has_ddi = 1,
 	.has_fpga_dbg = 1,
 	.has_fbc = 1,
@@ -434,7 +465,12 @@ static const struct intel_device_info intel_broxton_info = {
 	INTEL_SKL_GT1_IDS(&intel_skylake_info),	\
 	INTEL_SKL_GT2_IDS(&intel_skylake_info),	\
 	INTEL_SKL_GT3_IDS(&intel_skylake_gt3_info),	\
-	INTEL_BXT_IDS(&intel_broxton_info)
+	INTEL_SKL_GT4_IDS(&intel_skylake_gt3_info), \
+	INTEL_BXT_IDS(&intel_broxton_info), \
+	INTEL_KBL_GT1_IDS(&intel_kabylake_info), \
+	INTEL_KBL_GT2_IDS(&intel_kabylake_info), \
+	INTEL_KBL_GT3_IDS(&intel_kabylake_gt3_info), \
+	INTEL_KBL_GT4_IDS(&intel_kabylake_gt3_info)
 
 static const struct pci_device_id pciidlist[] = {		/* aka */
 	INTEL_PCI_IDS,
@@ -463,7 +499,7 @@ static enum intel_pch intel_virt_detect_pch(struct drm_device *dev)
 	} else if (IS_HASWELL(dev) || IS_BROADWELL(dev)) {
 		ret = PCH_LPT;
 		DRM_DEBUG_KMS("Assuming LynxPoint PCH\n");
-	} else if (IS_SKYLAKE(dev)) {
+	} else if (IS_SKYLAKE(dev) || IS_KABYLAKE(dev)) {
 		ret = PCH_SPT;
 		DRM_DEBUG_KMS("Assuming SunrisePoint PCH\n");
 	}
@@ -475,6 +511,8 @@ void intel_detect_pch(struct drm_device *dev)
 {
 	struct drm_i915_private *dev_priv = dev->dev_private;
 	struct pci_dev *pch = NULL;
+
+	printk("i915: intel_detect_pch\n");
 
 	/* In all current cases, num_pipes is equivalent to the PCH_NOP setting
 	 * (which really amounts to a PCH but no South Display).
@@ -526,15 +564,18 @@ void intel_detect_pch(struct drm_device *dev)
 			} else if (id == INTEL_PCH_SPT_DEVICE_ID_TYPE) {
 				dev_priv->pch_type = PCH_SPT;
 				DRM_DEBUG_KMS("Found SunrisePoint PCH\n");
-				WARN_ON(!IS_SKYLAKE(dev));
+				WARN_ON(!IS_SKYLAKE(dev) &&
+					!IS_KABYLAKE(dev));
 			} else if (id == INTEL_PCH_SPT_LP_DEVICE_ID_TYPE) {
 				dev_priv->pch_type = PCH_SPT;
 				DRM_DEBUG_KMS("Found SunrisePoint LP PCH\n");
-				WARN_ON(!IS_SKYLAKE(dev));
-			} else if ((id == INTEL_PCH_P2X_DEVICE_ID_TYPE) ||
-				   ((id == INTEL_PCH_QEMU_DEVICE_ID_TYPE) &&
-				    pch->subsystem_vendor == 0x1af4 &&
-				    pch->subsystem_device == 0x1100)) {
+				WARN_ON(!IS_SKYLAKE(dev) &&
+					!IS_KABYLAKE(dev));
+			} else if (id == INTEL_PCH_KBP_DEVICE_ID_TYPE) {
+				dev_priv->pch_type = PCH_KBP;
+				DRM_DEBUG_KMS("Found KabyPoint PCH\n");
+				WARN_ON(!IS_KABYLAKE(dev));
+			} else if (id == INTEL_PCH_P2X_DEVICE_ID_TYPE) {
 				dev_priv->pch_type = intel_virt_detect_pch(dev);
 			} else
 				continue;
@@ -744,6 +785,7 @@ int i915_suspend_switcheroo(struct drm_device *dev, pm_message_t state)
 static int i915_drm_resume(struct drm_device *dev)
 {
 	struct drm_i915_private *dev_priv = dev->dev_private;
+	int ret = 0;
 
 	mutex_lock(&dev->struct_mutex);
 	i915_gem_restore_gtt_mappings(dev);
@@ -841,7 +883,7 @@ static int i915_drm_resume_early(struct drm_device *dev)
 
 	if (IS_BROXTON(dev))
 		ret = bxt_resume_prepare(dev_priv);
-	else if (IS_SKYLAKE(dev_priv))
+	else if (IS_SKYLAKE(dev_priv) || IS_KABYLAKE(dev_priv))
 		ret = skl_resume_prepare(dev_priv);
 	else if (IS_HASWELL(dev_priv) || IS_BROADWELL(dev_priv))
 		hsw_disable_pc8(dev_priv);
@@ -978,6 +1020,8 @@ static int i915_pci_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	if (PCI_FUNC(pdev->devfn))
 		return -ENODEV;
 
+	driver.driver_features &= ~(DRIVER_USE_AGP);
+
 	return drm_get_pci_dev(pdev, ent, &driver);
 }
 
@@ -993,6 +1037,7 @@ static int i915_pm_suspend(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct drm_device *drm_dev = pci_get_drvdata(pdev);
+	int error;
 
 	if (!drm_dev || !drm_dev->dev_private) {
 		dev_err(dev, "DRM not initialized, aborting suspend.\n");
@@ -1002,7 +1047,18 @@ static int i915_pm_suspend(struct device *dev)
 	if (drm_dev->switch_power_state == DRM_SWITCH_POWER_OFF)
 		return 0;
 
-	return i915_drm_suspend(drm_dev);
+	error = i915_drm_suspend(drm_dev);
+	if (error)
+		return error;
+
+#ifdef CONFIG_I915_VGT
+	if (i915_host_mediate) {
+		error = vgt_suspend(pdev);
+		if (error)
+			return error;
+	}
+#endif
+	return 0;
 }
 
 static int i915_pm_suspend_late(struct device *dev)
@@ -1051,14 +1107,32 @@ static int i915_pm_resume(struct device *dev)
 	if (drm_dev->switch_power_state == DRM_SWITCH_POWER_OFF)
 		return 0;
 
+#ifdef DRM_I915_VGT_SUPPORT
+	if (i915_host_mediate) {
+		int error = vgt_resume(drm_dev->pdev);
+		if (error)
+			return error;
+	}
+#endif
+
 	return i915_drm_resume(drm_dev);
 }
 
 static int skl_suspend_complete(struct drm_i915_private *dev_priv)
 {
+	enum csr_state state;
 	/* Enabling DC6 is not a hard requirement to enter runtime D3 */
 
 	skl_uninit_cdclk(dev_priv);
+
+	/* TODO: wait for a completion event or
+	 * similar here instead of busy
+	 * waiting using wait_for function.
+	 */
+	wait_for((state = intel_csr_load_status_get(dev_priv)) !=
+			FW_UNINITIALIZED, 1000);
+	if (state == FW_LOADED)
+		skl_enable_dc6(dev_priv);
 
 	return 0;
 }
@@ -1105,6 +1179,9 @@ static int bxt_resume_prepare(struct drm_i915_private *dev_priv)
 static int skl_resume_prepare(struct drm_i915_private *dev_priv)
 {
 	struct drm_device *dev = dev_priv->dev;
+
+	if (intel_csr_load_status_get(dev_priv) == FW_LOADED)
+		skl_disable_dc6(dev_priv);
 
 	skl_init_cdclk(dev_priv);
 	intel_csr_load_program(dev);
@@ -1575,7 +1652,7 @@ static int intel_runtime_resume(struct device *device)
 
 	if (IS_BROXTON(dev))
 		ret = bxt_resume_prepare(dev_priv);
-	else if (IS_SKYLAKE(dev))
+	else if (IS_SKYLAKE(dev) || IS_KABYLAKE(dev))
 		ret = skl_resume_prepare(dev_priv);
 	else if (IS_HASWELL(dev_priv) || IS_BROADWELL(dev_priv))
 		hsw_disable_pc8(dev_priv);
@@ -1619,7 +1696,7 @@ static int intel_suspend_complete(struct drm_i915_private *dev_priv)
 
 	if (IS_BROXTON(dev_priv))
 		ret = bxt_suspend_complete(dev_priv);
-	else if (IS_SKYLAKE(dev_priv))
+	else if (IS_SKYLAKE(dev_priv) || IS_KABYLAKE(dev_priv))
 		ret = skl_suspend_complete(dev_priv);
 	else if (IS_HASWELL(dev_priv) || IS_BROADWELL(dev_priv))
 		ret = hsw_suspend_complete(dev_priv);

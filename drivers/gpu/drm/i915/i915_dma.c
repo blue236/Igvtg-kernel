@@ -51,6 +51,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/oom.h>
 
+static async_cookie_t async_fbdev_init_cfg_cookie;
 
 static int i915_getparam(struct drm_device *dev, void *data,
 			 struct drm_file *file_priv)
@@ -402,13 +403,14 @@ static int i915_load_modeset_init(struct drm_device *dev)
 	if (ret)
 		goto cleanup_gem_stolen;
 
-	intel_setup_gmbus(dev);
-
 	/* Important: The output setup functions called by modeset_init need
 	 * working irqs for e.g. gmbus and dp aux transfers. */
 	intel_modeset_init(dev);
 
+	/* intel_guc_ucode_init() needs the mutex to allocate GEM objects */
+	mutex_lock(&dev->struct_mutex);
 	intel_guc_ucode_init(dev);
+	mutex_unlock(&dev->struct_mutex);
 
 	ret = i915_gem_init(dev);
 	if (ret)
@@ -439,7 +441,8 @@ static int i915_load_modeset_init(struct drm_device *dev)
 	 * scanning against hotplug events. Hence do this first and ignore the
 	 * tiny window where we will loose hotplug notifactions.
 	 */
-	async_schedule(intel_fbdev_initial_config, dev_priv);
+	async_fbdev_init_cfg_cookie =
+		async_schedule(intel_fbdev_initial_config, dev_priv);
 
 	drm_kms_helper_poll_init(dev);
 
@@ -451,9 +454,10 @@ cleanup_gem:
 	i915_gem_context_fini(dev);
 	mutex_unlock(&dev->struct_mutex);
 cleanup_irq:
+	mutex_lock(&dev->struct_mutex);
 	intel_guc_ucode_fini(dev);
+	mutex_unlock(&dev->struct_mutex);
 	drm_irq_uninstall(dev);
-	intel_teardown_gmbus(dev);
 cleanup_gem_stolen:
 	i915_gem_cleanup_stolen(dev);
 cleanup_vga_switcheroo:
@@ -666,7 +670,8 @@ static void gen9_sseu_info_init(struct drm_device *dev)
 	 * supports EU power gating on devices with more than one EU
 	 * pair per subslice.
 	*/
-	info->has_slice_pg = (IS_SKYLAKE(dev) && (info->slice_total > 1));
+	info->has_slice_pg = ((IS_SKYLAKE(dev) || IS_KABYLAKE(dev)) &&
+			       (info->slice_total > 1));
 	info->has_subslice_pg = (IS_BROXTON(dev) && (info->subslice_total > 1));
 	info->has_eu_pg = (info->eu_per_subslice > 2);
 }
@@ -812,6 +817,37 @@ static void intel_device_info_runtime_init(struct drm_device *dev)
 			DRM_INFO("Display fused off, disabling\n");
 			info->num_pipes = 0;
 		}
+	} else if (info->num_pipes > 0 && INTEL_INFO(dev)->gen == 9) {
+		u32 dfsm = I915_READ(SKL_DFSM);
+		u8 disabled_mask = 0;
+		bool invalid;
+		int num_bits;
+
+		if (dfsm & SKL_DFSM_PIPE_A_DISABLE)
+			disabled_mask |= BIT(PIPE_A);
+		if (dfsm & SKL_DFSM_PIPE_B_DISABLE)
+			disabled_mask |= BIT(PIPE_B);
+		if (dfsm & SKL_DFSM_PIPE_C_DISABLE)
+			disabled_mask |= BIT(PIPE_C);
+
+		num_bits = hweight8(disabled_mask);
+
+		switch (disabled_mask) {
+		case BIT(PIPE_A):
+		case BIT(PIPE_B):
+		case BIT(PIPE_A) | BIT(PIPE_B):
+		case BIT(PIPE_A) | BIT(PIPE_C):
+			invalid = true;
+			break;
+		default:
+			invalid = false;
+		}
+
+		if (num_bits > info->num_pipes || invalid)
+			DRM_ERROR("invalid pipe fuse configuration: 0x%x\n",
+				  disabled_mask);
+		else
+			info->num_pipes -= num_bits;
 	}
 
 	/* Initialize slice/subslice/EU info */
@@ -864,6 +900,8 @@ static void intel_init_dpio(struct drm_i915_private *dev_priv)
  *   - allocate initial config memory
  *   - setup the DRM framebuffer with the allocated memory
  */
+struct drm_i915_private *gpu_perf_dev_priv;
+
 int i915_driver_load(struct drm_device *dev, unsigned long flags)
 {
 	struct drm_i915_private *dev_priv;
@@ -877,7 +915,8 @@ int i915_driver_load(struct drm_device *dev, unsigned long flags)
 	if (dev_priv == NULL)
 		return -ENOMEM;
 
-	dev->dev_private = dev_priv;
+	dev->dev_private = (void *)dev_priv;
+	gpu_perf_dev_priv = (void *)dev_priv;
 	dev_priv->dev = dev;
 
 	/* Setup the write-once "constant" device info */
@@ -897,6 +936,7 @@ int i915_driver_load(struct drm_device *dev, unsigned long flags)
 	mutex_init(&dev_priv->av_mutex);
 
 	intel_pm_setup(dev);
+	intel_init_clock_gating_hooks(dev_priv);
 
 	intel_display_crc_init(dev);
 
@@ -939,6 +979,25 @@ int i915_driver_load(struct drm_device *dev, unsigned long flags)
 	intel_detect_pch(dev);
 
 	intel_uncore_init(dev);
+
+	if (i915_start_vgt(dev->pdev))
+		i915_host_mediate = true;
+	printk("i915_start_vgt: %s\n", i915_host_mediate ? "success" : "fail");
+
+#if IS_ENABLED(CONFIG_I915_VGT)
+	if (i915_host_mediate) {
+		extern bool (*tmp_vgt_can_process_timer)(void *timer);
+		extern void (*tmp_vgt_new_delay_event_timer)(void *timer);
+
+		tmp_vgt_new_delay_event_timer = vgt_new_delay_event_timer;
+		tmp_vgt_can_process_timer = vgt_can_process_timer;
+	}
+#endif
+
+	i915_check_vgpu(dev);
+
+	if (intel_vgpu_active(dev))
+		i915.enable_ips = 0;
 
 	/* Load CSR Firmware for SKL */
 	intel_csr_ucode_init(dev);
@@ -1031,6 +1090,7 @@ int i915_driver_load(struct drm_device *dev, unsigned long flags)
 
 	/* Try to make sure MCHBAR is enabled before poking at it */
 	intel_setup_mchbar(dev);
+	intel_setup_gmbus(dev);
 	intel_opregion_setup(dev);
 
 	i915_gem_load(dev);
@@ -1101,6 +1161,7 @@ out_gem_unload:
 	if (dev->pdev->msi_enabled)
 		pci_disable_msi(dev->pdev);
 
+	intel_teardown_gmbus(dev);
 	intel_teardown_mchbar(dev);
 	pm_qos_remove_request(&dev_priv->pm_qos);
 	destroy_workqueue(dev_priv->gpu_error.hangcheck_wq);
@@ -1160,6 +1221,11 @@ int i915_driver_unload(struct drm_device *dev)
 
 	intel_modeset_cleanup(dev);
 
+	if (i915_host_mediate) {
+		i915_stop_vgt();
+		i915_host_mediate = false;
+	}
+
 	/*
 	 * free the memory space allocated for the child device
 	 * config parsed from VBT
@@ -1189,8 +1255,8 @@ int i915_driver_unload(struct drm_device *dev)
 	/* Flush any outstanding unpin_work. */
 	flush_workqueue(dev_priv->wq);
 
-	intel_guc_ucode_fini(dev);
 	mutex_lock(&dev->struct_mutex);
+	intel_guc_ucode_fini(dev);
 	i915_gem_cleanup_ringbuffer(dev);
 	i915_gem_context_fini(dev);
 	mutex_unlock(&dev->struct_mutex);
@@ -1199,6 +1265,7 @@ int i915_driver_unload(struct drm_device *dev)
 
 	intel_csr_ucode_fini(dev);
 
+	intel_teardown_gmbus(dev);
 	intel_teardown_mchbar(dev);
 
 	destroy_workqueue(dev_priv->hotplug.dp_wq);
@@ -1246,6 +1313,14 @@ int i915_driver_open(struct drm_device *dev, struct drm_file *file)
  */
 void i915_driver_lastclose(struct drm_device *dev)
 {
+	/*
+	 * There is special case that try to access the ifdev->fb before
+	 * initialization of it, since the intel_fbdev_initial_config is
+	 * assigned into async queue during i915_driver_load, wait for
+	 * intel_fbdev_initial_config() to be completed.
+	 */
+	async_synchronize_cookie(async_fbdev_init_cfg_cookie + 1);
+
 	intel_fbdev_restore_mode(dev);
 	vga_switcheroo_process_delayed_switch();
 }
@@ -1329,6 +1404,7 @@ const struct drm_ioctl_desc i915_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(I915_GEM_USERPTR, i915_gem_userptr_ioctl, DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(I915_GEM_CONTEXT_GETPARAM, i915_gem_context_getparam_ioctl, DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(I915_GEM_CONTEXT_SETPARAM, i915_gem_context_setparam_ioctl, DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(I915_GEM_VGTBUFFER, i915_gem_vgtbuffer_ioctl, DRM_RENDER_ALLOW),
 };
 
 int i915_max_ioctl = ARRAY_SIZE(i915_ioctls);

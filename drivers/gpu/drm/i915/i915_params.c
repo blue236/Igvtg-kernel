@@ -36,11 +36,11 @@ struct i915_params i915 __read_mostly = {
 	.enable_execlists = -1,
 	.enable_hangcheck = true,
 	.enable_ppgtt = -1,
+	.ctx_switch = true,
 	.enable_psr = 0,
 	.preliminary_hw_support = IS_ENABLED(CONFIG_DRM_I915_PRELIMINARY_HW_SUPPORT),
-	.disable_power_well = -1,
+	.disable_power_well = 1,
 	.enable_ips = 1,
-	.fastboot = 0,
 	.prefault_disable = 0,
 	.load_detect_test = 0,
 	.reset = true,
@@ -55,6 +55,7 @@ struct i915_params i915 __read_mostly = {
 	.edp_vswing = 0,
 	.enable_guc_submission = false,
 	.guc_log_level = -1,
+	.gen9_pg_wa_enable = true,
 };
 
 module_param_named(modeset, i915.modeset, int, 0400);
@@ -112,7 +113,11 @@ MODULE_PARM_DESC(enable_hangcheck,
 module_param_named_unsafe(enable_ppgtt, i915.enable_ppgtt, int, 0400);
 MODULE_PARM_DESC(enable_ppgtt,
 	"Override PPGTT usage. "
-	"(-1=auto [default], 0=disabled, 1=aliasing, 2=full)");
+	"(-1=auto [default], 0=disabled, 1=aliasing, 2=full, 3=full with extended address space)");
+
+module_param_named(ctx_switch, i915.ctx_switch, bool, 0600);
+MODULE_PARM_DESC(ctx_switch,
+                "Enable HW context switch (default: true)");
 
 module_param_named_unsafe(enable_execlists, i915.enable_execlists, int, 0400);
 MODULE_PARM_DESC(enable_execlists,
@@ -128,15 +133,10 @@ MODULE_PARM_DESC(preliminary_hw_support,
 
 module_param_named_unsafe(disable_power_well, i915.disable_power_well, int, 0600);
 MODULE_PARM_DESC(disable_power_well,
-	"Disable display power wells when possible "
-	"(-1=auto [default], 0=power wells always on, 1=power wells disabled when possible)");
+	"Disable the power well when possible (default: true)");
 
 module_param_named_unsafe(enable_ips, i915.enable_ips, int, 0600);
 MODULE_PARM_DESC(enable_ips, "Enable IPS (default: true)");
-
-module_param_named(fastboot, i915.fastboot, bool, 0600);
-MODULE_PARM_DESC(fastboot,
-	"Try to skip unnecessary mode sets at boot time (default: false)");
 
 module_param_named_unsafe(prefault_disable, i915.prefault_disable, bool, 0600);
 MODULE_PARM_DESC(prefault_disable,
@@ -196,3 +196,9 @@ MODULE_PARM_DESC(enable_guc_submission, "Enable GuC submission (default:false)")
 module_param_named(guc_log_level, i915.guc_log_level, int, 0400);
 MODULE_PARM_DESC(guc_log_level,
 	"GuC firmware logging level (-1:disabled (default), 0-3:enabled)");
+
+module_param_named(gen9_pg_wa_enable, i915.gen9_pg_wa_enable, bool, 0600);
+MODULE_PARM_DESC(gen9_pg_wa_enable,
+	"Enable gen9 power gating WA (1=enabled [default], 0=disabled)."
+	"When power gating WA enabled, Render and Media engine will not"
+	"be power gated when RC6");

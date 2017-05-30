@@ -109,6 +109,13 @@ i915_gem_wait_for_error(struct i915_gpu_error *error)
 	return 0;
 }
 
+int i915_wait_error_work_complete(struct drm_device *dev)
+{
+       struct drm_i915_private *dev_priv = dev->dev_private;
+
+       return i915_gem_wait_for_error(&dev_priv->gpu_error);
+}
+
 int i915_mutex_lock_interruptible(struct drm_device *dev)
 {
 	struct drm_i915_private *dev_priv = dev->dev_private;
@@ -146,8 +153,15 @@ i915_gem_get_aperture_ioctl(struct drm_device *dev, void *data,
 			pinned += vma->node.size;
 	mutex_unlock(&dev->struct_mutex);
 
-	args->aper_size = dev_priv->gtt.base.total;
-	args->aper_available_size = args->aper_size - pinned;
+	if (!intel_vgpu_active(dev)) {
+		args->aper_size = dev_priv->gtt.base.total;
+		args->aper_available_size = args->aper_size - pinned;
+#if IS_ENABLED(CONFIG_I915_VGT)
+	} else {
+		args->aper_size = dev_priv->mm.vgt_low_gm_size + dev_priv->mm.vgt_high_gm_size;
+		args->aper_available_size = dev_priv->mm.vgt_low_gm_size + dev_priv->mm.vgt_high_gm_size - pinned;
+#endif
+	}
 
 	return 0;
 }
@@ -1146,74 +1160,23 @@ static bool missed_irq(struct drm_i915_private *dev_priv,
 	return test_bit(ring->id, &dev_priv->gpu_error.missed_irq_rings);
 }
 
-static unsigned long local_clock_us(unsigned *cpu)
-{
-	unsigned long t;
-
-	/* Cheaply and approximately convert from nanoseconds to microseconds.
-	 * The result and subsequent calculations are also defined in the same
-	 * approximate microseconds units. The principal source of timing
-	 * error here is from the simple truncation.
-	 *
-	 * Note that local_clock() is only defined wrt to the current CPU;
-	 * the comparisons are no longer valid if we switch CPUs. Instead of
-	 * blocking preemption for the entire busywait, we can detect the CPU
-	 * switch and use that as indicator of system load and a reason to
-	 * stop busywaiting, see busywait_stop().
-	 */
-	*cpu = get_cpu();
-	t = local_clock() >> 10;
-	put_cpu();
-
-	return t;
-}
-
-static bool busywait_stop(unsigned long timeout, unsigned cpu)
-{
-	unsigned this_cpu;
-
-	if (time_after(local_clock_us(&this_cpu), timeout))
-		return true;
-
-	return this_cpu != cpu;
-}
-
-static int __i915_spin_request(struct drm_i915_gem_request *req, int state)
+static int __i915_spin_request(struct drm_i915_gem_request *req)
 {
 	unsigned long timeout;
-	unsigned cpu;
 
-	/* When waiting for high frequency requests, e.g. during synchronous
-	 * rendering split between the CPU and GPU, the finite amount of time
-	 * required to set up the irq and wait upon it limits the response
-	 * rate. By busywaiting on the request completion for a short while we
-	 * can service the high frequency waits as quick as possible. However,
-	 * if it is a slow request, we want to sleep as quickly as possible.
-	 * The tradeoff between waiting and sleeping is roughly the time it
-	 * takes to sleep on a request, on the order of a microsecond.
-	 */
-
-	if (req->ring->irq_refcount)
+	if (i915_gem_request_get_ring(req)->irq_refcount)
 		return -EBUSY;
 
-	/* Only spin if we know the GPU is processing this request */
-	if (!i915_gem_request_started(req, true))
-		return -EAGAIN;
-
-	timeout = local_clock_us(&cpu) + 5;
+	timeout = jiffies + 1;
 	while (!need_resched()) {
 		if (i915_gem_request_completed(req, true))
 			return 0;
 
-		if (signal_pending_state(state, current))
-			break;
-
-		if (busywait_stop(timeout, cpu))
+		if (time_after_eq(jiffies, timeout))
 			break;
 
 		cpu_relax_lowlatency();
 	}
-
 	if (i915_gem_request_completed(req, false))
 		return 0;
 
@@ -1248,7 +1211,6 @@ int __i915_wait_request(struct drm_i915_gem_request *req,
 	struct drm_i915_private *dev_priv = dev->dev_private;
 	const bool irq_test_in_progress =
 		ACCESS_ONCE(dev_priv->gpu_error.test_irq_rings) & intel_ring_flag(ring);
-	int state = interruptible ? TASK_INTERRUPTIBLE : TASK_UNINTERRUPTIBLE;
 	DEFINE_WAIT(wait);
 	unsigned long timeout_expire;
 	s64 before, now;
@@ -1262,16 +1224,8 @@ int __i915_wait_request(struct drm_i915_gem_request *req,
 	if (i915_gem_request_completed(req, true))
 		return 0;
 
-	timeout_expire = 0;
-	if (timeout) {
-		if (WARN_ON(*timeout < 0))
-			return -EINVAL;
-
-		if (*timeout == 0)
-			return -ETIME;
-
-		timeout_expire = jiffies + nsecs_to_jiffies_timeout(*timeout);
-	}
+	timeout_expire = timeout ?
+		jiffies + nsecs_to_jiffies_timeout((u64)*timeout) : 0;
 
 	if (INTEL_INFO(dev_priv)->gen >= 6)
 		gen6_rps_boost(dev_priv, rps, req->emitted_jiffies);
@@ -1281,7 +1235,7 @@ int __i915_wait_request(struct drm_i915_gem_request *req,
 	before = ktime_get_raw_ns();
 
 	/* Optimistic spin for the next jiffie before touching IRQs */
-	ret = __i915_spin_request(req, state);
+	ret = __i915_spin_request(req);
 	if (ret == 0)
 		goto out;
 
@@ -1293,7 +1247,8 @@ int __i915_wait_request(struct drm_i915_gem_request *req,
 	for (;;) {
 		struct timer_list timer;
 
-		prepare_to_wait(&ring->irq_queue, &wait, state);
+		prepare_to_wait(&ring->irq_queue, &wait,
+				interruptible ? TASK_INTERRUPTIBLE : TASK_UNINTERRUPTIBLE);
 
 		/* We need to check whether any gpu reset happened in between
 		 * the caller grabbing the seqno and now ... */
@@ -1311,7 +1266,7 @@ int __i915_wait_request(struct drm_i915_gem_request *req,
 			break;
 		}
 
-		if (signal_pending_state(state, current)) {
+		if (interruptible && signal_pending(current)) {
 			ret = -ERESTARTSYS;
 			break;
 		}
@@ -2605,7 +2560,6 @@ void __i915_add_request(struct drm_i915_gem_request *request,
 	request->batch_obj = obj;
 
 	request->emitted_jiffies = jiffies;
-	request->previous_seqno = ring->last_submitted_seqno;
 	ring->last_submitted_seqno = request->seqno;
 	list_add_tail(&request->list, &ring->request_list);
 
@@ -2812,18 +2766,23 @@ static void i915_gem_reset_ring_cleanup(struct drm_i915_private *dev_priv,
 	 * are the ones that keep the context and ringbuffer backing objects
 	 * pinned in place.
 	 */
-	while (!list_empty(&ring->execlist_queue)) {
-		struct drm_i915_gem_request *submit_req;
 
-		submit_req = list_first_entry(&ring->execlist_queue,
-				struct drm_i915_gem_request,
-				execlist_link);
-		list_del(&submit_req->execlist_link);
+	if (i915.enable_execlists) {
+		spin_lock_irq(&ring->execlist_lock);
+		while (!list_empty(&ring->execlist_queue)) {
+			struct drm_i915_gem_request *submit_req;
 
-		if (submit_req->ctx != ring->default_context)
-			intel_lr_context_unpin(submit_req);
+			submit_req = list_first_entry(&ring->execlist_queue,
+					struct drm_i915_gem_request,
+					execlist_link);
+			list_del(&submit_req->execlist_link);
 
-		i915_gem_request_unreference(submit_req);
+			if (submit_req->ctx != ring->default_context)
+				intel_lr_context_unpin(submit_req);
+
+			i915_gem_request_unreference(submit_req);
+		}
+		spin_unlock_irq(&ring->execlist_lock);
 	}
 
 	/*
@@ -3319,12 +3278,14 @@ static int __i915_vma_unbind(struct i915_vma *vma, bool wait)
 	}
 
 	drm_mm_remove_node(&vma->node);
+
 	i915_gem_vma_destroy(vma);
 
 	/* Since the unbound list is global, only move to that list if
 	 * no more VMAs exist. */
-	if (list_empty(&obj->vma_list))
+	if (list_empty(&obj->vma_list)) {
 		list_move_tail(&obj->global_list, &dev_priv->mm.unbound_list);
+	}
 
 	/* And finally now the object is completely decoupled from this vma,
 	 * we can drop its hold on the backing storage and allow it to be
@@ -3531,6 +3492,12 @@ search_free:
 					       flags);
 		if (ret == 0)
 			goto search_free;
+
+		DRM_ERROR("fail to allocate space from %s GM space, size: %u.\n",
+				obj->map_and_fenceable ? "low" : "whole",
+				size);
+
+		dump_stack();
 
 		goto err_free_vma;
 	}
@@ -3869,7 +3836,6 @@ int i915_gem_get_caching_ioctl(struct drm_device *dev, void *data,
 int i915_gem_set_caching_ioctl(struct drm_device *dev, void *data,
 			       struct drm_file *file)
 {
-	struct drm_i915_private *dev_priv = dev->dev_private;
 	struct drm_i915_gem_caching *args = data;
 	struct drm_i915_gem_object *obj;
 	enum i915_cache_level level;
@@ -3886,7 +3852,7 @@ int i915_gem_set_caching_ioctl(struct drm_device *dev, void *data,
 		 * cacheline, whereas normally such cachelines would get
 		 * invalidated.
 		 */
-		if (IS_BROXTON(dev) && INTEL_REVID(dev) < BXT_REVID_B0)
+		if (IS_BXT_REVID(dev, 0, BXT_REVID_A1))
 			return -ENODEV;
 
 		level = I915_CACHE_LLC;
@@ -3898,11 +3864,9 @@ int i915_gem_set_caching_ioctl(struct drm_device *dev, void *data,
 		return -EINVAL;
 	}
 
-	intel_runtime_pm_get(dev_priv);
-
 	ret = i915_mutex_lock_interruptible(dev);
 	if (ret)
-		goto rpm_put;
+		return ret;
 
 	obj = to_intel_bo(drm_gem_object_lookup(dev, file, args->handle));
 	if (&obj->base == NULL) {
@@ -3915,9 +3879,6 @@ int i915_gem_set_caching_ioctl(struct drm_device *dev, void *data,
 	drm_gem_object_unreference(&obj->base);
 unlock:
 	mutex_unlock(&dev->struct_mutex);
-rpm_put:
-	intel_runtime_pm_put(dev_priv);
-
 	return ret;
 }
 
@@ -4132,29 +4093,6 @@ i915_vma_misplaced(struct i915_vma *vma, uint32_t alignment, uint64_t flags)
 	return false;
 }
 
-void __i915_vma_set_map_and_fenceable(struct i915_vma *vma)
-{
-	struct drm_i915_gem_object *obj = vma->obj;
-	bool mappable, fenceable;
-	u32 fence_size, fence_alignment;
-
-	fence_size = i915_gem_get_gtt_size(obj->base.dev,
-					   obj->base.size,
-					   obj->tiling_mode);
-	fence_alignment = i915_gem_get_gtt_alignment(obj->base.dev,
-						     obj->base.size,
-						     obj->tiling_mode,
-						     true);
-
-	fenceable = (vma->node.size == fence_size &&
-		     (vma->node.start & (fence_alignment - 1)) == 0);
-
-	mappable = (vma->node.start + fence_size <=
-		    to_i915(obj->base.dev)->gtt.mappable_end);
-
-	obj->map_and_fenceable = mappable && fenceable;
-}
-
 static int
 i915_gem_object_do_pin(struct drm_i915_gem_object *obj,
 		       struct i915_address_space *vm,
@@ -4222,7 +4160,25 @@ i915_gem_object_do_pin(struct drm_i915_gem_object *obj,
 
 	if (ggtt_view && ggtt_view->type == I915_GGTT_VIEW_NORMAL &&
 	    (bound ^ vma->bound) & GLOBAL_BIND) {
-		__i915_vma_set_map_and_fenceable(vma);
+		bool mappable, fenceable;
+		u32 fence_size, fence_alignment;
+
+		fence_size = i915_gem_get_gtt_size(obj->base.dev,
+						   obj->base.size,
+						   obj->tiling_mode);
+		fence_alignment = i915_gem_get_gtt_alignment(obj->base.dev,
+							     obj->base.size,
+							     obj->tiling_mode,
+							     true);
+
+		fenceable = (vma->node.size == fence_size &&
+			     (vma->node.start & (fence_alignment - 1)) == 0);
+
+		mappable = (vma->node.start + fence_size <=
+			    dev_priv->gtt.mappable_end);
+
+		obj->map_and_fenceable = mappable && fenceable;
+
 		WARN_ON(flags & PIN_MAPPABLE && !obj->map_and_fenceable);
 	}
 
@@ -4569,6 +4525,7 @@ struct i915_vma *i915_gem_obj_to_ggtt_view(struct drm_i915_gem_object *obj,
 void i915_gem_vma_destroy(struct i915_vma *vma)
 {
 	struct i915_address_space *vm = NULL;
+
 	WARN_ON(vma->node.allocated);
 
 	/* Keep the vma as a placeholder in the execbuffer reservation lists */
@@ -4817,7 +4774,7 @@ i915_gem_init_hw(struct drm_device *dev)
 	}
 
 	/* We can't enable contexts until all firmware is loaded */
-	if (HAS_GUC_UCODE(dev)) {
+	if (HAS_GUC_UCODE(dev) && !intel_vgpu_active(dev)) {
 		ret = intel_guc_ucode_load(dev);
 		if (ret) {
 			/*
@@ -4833,7 +4790,8 @@ i915_gem_init_hw(struct drm_device *dev)
 			if (ret)
 				goto out;
 		}
-	}
+	} else
+		i915.enable_guc_submission = false;
 
 	/*
 	 * Increment the next seqno by 0x100 so we have a visible break

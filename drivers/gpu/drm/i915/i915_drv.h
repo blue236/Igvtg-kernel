@@ -39,6 +39,7 @@
 #include "intel_lrc.h"
 #include "i915_gem_gtt.h"
 #include "i915_gem_render_state.h"
+#include "i915_vgt.h"
 #include <linux/io-mapping.h>
 #include <linux/i2c.h>
 #include <linux/i2c-algo-bit.h>
@@ -51,6 +52,11 @@
 #include <linux/kref.h>
 #include <linux/pm_qos.h>
 #include "intel_guc.h"
+
+#ifdef CONFIG_I915_VGT
+#include <linux/irq_work.h>
+#define DRM_I915_VGT_SUPPORT	1
+#endif
 
 /* General customization:
  */
@@ -199,7 +205,6 @@ enum intel_display_power_domain {
 	POWER_DOMAIN_AUX_B,
 	POWER_DOMAIN_AUX_C,
 	POWER_DOMAIN_AUX_D,
-	POWER_DOMAIN_GMBUS,
 	POWER_DOMAIN_INIT,
 
 	POWER_DOMAIN_NUM,
@@ -352,8 +357,6 @@ enum intel_dpll_id {
 	/* hsw/bdw */
 	DPLL_ID_WRPLL1 = 0,
 	DPLL_ID_WRPLL2 = 1,
-	DPLL_ID_SPLL = 2,
-
 	/* skl */
 	DPLL_ID_SKL_DPLL1 = 0,
 	DPLL_ID_SKL_DPLL2 = 1,
@@ -370,7 +373,6 @@ struct intel_dpll_hw_state {
 
 	/* hsw, bdw */
 	uint32_t wrpll;
-	uint32_t spll;
 
 	/* skl */
 	/*
@@ -631,11 +633,9 @@ struct drm_i915_display_funcs {
 			  int target, int refclk,
 			  struct dpll *match_clock,
 			  struct dpll *best_clock);
+	int (*compute_pipe_wm)(struct intel_crtc *crtc,
+			       struct drm_atomic_state *state);
 	void (*update_wm)(struct drm_crtc *crtc);
-	void (*update_sprite_wm)(struct drm_plane *plane,
-				 struct drm_crtc *crtc,
-				 uint32_t sprite_width, uint32_t sprite_height,
-				 int pixel_size, bool enable, bool scaled);
 	int (*modeset_calc_cdclk)(struct drm_atomic_state *state);
 	void (*modeset_commit_cdclk)(struct drm_atomic_state *state);
 	/* Returns the active state of the crtc, and if the crtc is active,
@@ -771,6 +771,8 @@ struct intel_csr {
 	func(is_valleyview) sep \
 	func(is_haswell) sep \
 	func(is_skylake) sep \
+	func(is_broxton) sep \
+	func(is_kabylake) sep \
 	func(is_preliminary) sep \
 	func(has_fbc) sep \
 	func(has_pipe_cxsr) sep \
@@ -998,6 +1000,7 @@ enum intel_pch {
 	PCH_CPT,	/* Cougarpoint PCH */
 	PCH_LPT,	/* Lynxpoint PCH */
 	PCH_SPT,        /* Sunrisepoint PCH */
+	PCH_KBP,        /* Kabypoint PCH */
 	PCH_NOP,
 };
 
@@ -1159,7 +1162,7 @@ struct intel_gen6_power_mgmt {
 	struct intel_rps_client semaphores, mmioflips;
 
 	/* manual wa residency calculations */
-	struct intel_rps_ei ei;
+	struct intel_rps_ei up_ei, down_ei;
 
 	/*
 	 * Protects RPS/RC6 register access and PCU communication.
@@ -1278,6 +1281,12 @@ struct i915_gem_mm {
 
 	/** PPGTT used for aliasing the PPGTT with the GTT */
 	struct i915_hw_ppgtt *aliasing_ppgtt;
+	/*
+	 * VGT:
+	 * Original i915 driver in 3.11.6 remove this entry,
+	 * whatever we need this for PPGTT ballooning.
+	 */
+	unsigned int first_ppgtt_pde_in_gtt;
 
 	struct notifier_block oom_notifier;
 	struct shrinker shrinker;
@@ -1330,6 +1339,14 @@ struct i915_gem_mm {
 	spinlock_t object_stat_lock;
 	size_t object_memory;
 	u32 object_count;
+
+#ifdef DRM_I915_VGT_SUPPORT
+	/* VGT balloon info */
+	unsigned long vgt_low_gm_base;
+	unsigned long vgt_low_gm_size;
+	unsigned long vgt_high_gm_base;
+	unsigned long vgt_high_gm_size;
+#endif
 };
 
 struct drm_i915_error_state_buf {
@@ -1675,11 +1692,18 @@ struct i915_wa_reg {
 	u32 mask;
 };
 
-#define I915_MAX_WA_REGS 16
+/*
+ * RING_MAX_NONPRIV_SLOTS is per-engine but at this point we are only
+ * allowing it for RCS as we don't foresee any requirement of having
+ * a whitelist for other engines. When it is really required for
+ * other engines then the limit need to be increased.
+ */
+#define I915_MAX_WA_REGS (16 + RING_MAX_NONPRIV_SLOTS)
 
 struct i915_workarounds {
 	struct i915_wa_reg reg[I915_MAX_WA_REGS];
 	u32 count;
+	u32 hw_whitelist_count[I915_NUM_RINGS];
 };
 
 struct i915_virtual_gpu {
@@ -1696,6 +1720,13 @@ struct i915_execbuffer_params {
 	struct drm_i915_gem_object      *batch_obj;
 	struct intel_context            *ctx;
 	struct drm_i915_gem_request     *request;
+};
+
+/* used in computing the new watermarks state */
+struct intel_wm_config {
+	unsigned int num_pipes_active;
+	bool sprites_enabled;
+	bool sprites_scaled;
 };
 
 struct drm_i915_private {
@@ -1768,8 +1799,8 @@ struct drm_i915_private {
 	u32 pm_irq_mask;
 	u32 pm_rps_events;
 	u32 pipestat_irq_mask[I915_MAX_PIPES];
-
 	struct i915_hotplug hotplug;
+
 	struct i915_fbc fbc;
 	struct i915_drrs drrs;
 	struct intel_opregion opregion;
@@ -1922,6 +1953,9 @@ struct drm_i915_private {
 		 */
 		uint16_t skl_latency[8];
 
+		/* Committed wm config */
+		struct intel_wm_config config;
+
 		/*
 		 * The skl_wm_values structure is a bit too big for stack
 		 * allocation, so we keep the staging struct where we store
@@ -1940,6 +1974,21 @@ struct drm_i915_private {
 	} wm;
 
 	struct i915_runtime_pm pm;
+
+#ifdef CONFIG_I915_VGT
+	/* vgt host-side mediation */
+	void *pgt;
+	struct irq_work irq_work;
+	spinlock_t irq_work_lock;
+	struct {
+		irqreturn_t(*irq_handler) (int irq, void *arg);
+		void (*irq_preinstall) (struct drm_device *dev);
+		int (*irq_postinstall) (struct drm_device *dev);
+		void (*irq_uninstall) (struct drm_device *dev);
+	} irq_ops;
+#endif
+
+	unsigned long value_of_0xfdc;
 
 	/* Abstract the submission mechanism (legacy ringbuffer or execlists) away */
 	struct {
@@ -2009,6 +2058,8 @@ struct drm_i915_gem_object_ops {
 	void (*put_pages)(struct drm_i915_gem_object *);
 	int (*dmabuf_export)(struct drm_i915_gem_object *);
 	void (*release)(struct drm_i915_gem_object *);
+	int (*pin)(struct drm_i915_gem_object *, uint32_t, bool, bool);
+	void (*unpin)(struct drm_i915_gem_object *);
 };
 
 /*
@@ -2150,20 +2201,23 @@ struct drm_i915_gem_object {
 	/** Record of address bit 17 of each page at last unbind. */
 	unsigned long *bit_17;
 
-	struct i915_gem_userptr {
-		uintptr_t ptr;
-		unsigned read_only :1;
-		unsigned workers :4;
+	union {
+		/** for phy allocated objects */
+		struct drm_dma_handle *phys_handle;
+
+		struct i915_gem_userptr {
+			uintptr_t ptr;
+			unsigned read_only :1;
+			unsigned workers :4;
 #define I915_GEM_USERPTR_MAX_WORKERS 15
 
-		struct i915_mm_struct *mm;
-		struct i915_mmu_object *mmu_object;
-		struct work_struct *work;
-	} userptr;
-
-	/** for phys allocated objects */
-	struct drm_dma_handle *phys_handle;
+			struct i915_mm_struct *mm;
+			struct i915_mmu_object *mmu_object;
+			struct work_struct *work;
+		} userptr;
+	};
 };
+
 #define to_intel_bo(x) container_of(x, struct drm_i915_gem_object, base)
 
 void i915_gem_track_fb(struct drm_i915_gem_object *old,
@@ -2191,17 +2245,8 @@ struct drm_i915_gem_request {
 	struct drm_i915_private *i915;
 	struct intel_engine_cs *ring;
 
-	 /** GEM sequence number associated with the previous request,
-	  * when the HWS breadcrumb is equal to this the GPU is processing
-	  * this request.
-	  */
-	u32 previous_seqno;
-
-	 /** GEM sequence number associated with this request,
-	  * when the HWS breadcrumb is equal or greater than this the GPU
-	  * has finished processing this request.
-	  */
-	u32 seqno;
+	/** GEM sequence number associated with this request. */
+	uint32_t seqno;
 
 	/** Position in the ringbuffer of the start of the request */
 	u32 head;
@@ -2443,6 +2488,15 @@ struct drm_i915_cmd_table {
 #define INTEL_DEVID(p)	(INTEL_INFO(p)->device_id)
 #define INTEL_REVID(p)	(__I915__(p)->dev->pdev->revision)
 
+#define REVID_FOREVER		0xff
+/*
+ * Return true if revision is in range [since,until] inclusive.
+ *
+ * Use 0 for open-ended since, and REVID_FOREVER for open-ended until.
+ */
+#define IS_REVID(p, since, until) \
+	(INTEL_REVID(p) >= (since) && INTEL_REVID(p) <= (until))
+
 #define IS_I830(dev)		(INTEL_DEVID(dev) == 0x3577)
 #define IS_845G(dev)		(INTEL_DEVID(dev) == 0x2562)
 #define IS_I85X(dev)		(INTEL_INFO(dev)->is_i85x)
@@ -2469,7 +2523,8 @@ struct drm_i915_cmd_table {
 #define IS_HASWELL(dev)	(INTEL_INFO(dev)->is_haswell)
 #define IS_BROADWELL(dev)	(!INTEL_INFO(dev)->is_valleyview && IS_GEN8(dev))
 #define IS_SKYLAKE(dev)	(INTEL_INFO(dev)->is_skylake)
-#define IS_BROXTON(dev)	(!INTEL_INFO(dev)->is_skylake && IS_GEN9(dev))
+#define IS_BROXTON(dev)		(INTEL_INFO(dev)->is_broxton)
+#define IS_KABYLAKE(dev)	(INTEL_INFO(dev)->is_kabylake)
 #define IS_MOBILE(dev)		(INTEL_INFO(dev)->is_mobile)
 #define IS_HSW_EARLY_SDV(dev)	(IS_HASWELL(dev) && \
 				 (INTEL_DEVID(dev) & 0xFF00) == 0x0C00)
@@ -2497,6 +2552,14 @@ struct drm_i915_cmd_table {
 #define IS_SKL_ULX(dev)		(INTEL_DEVID(dev) == 0x190E || \
 				 INTEL_DEVID(dev) == 0x1915 || \
 				 INTEL_DEVID(dev) == 0x191E)
+#define IS_KBL_ULT(dev)		(INTEL_DEVID(dev) == 0x5906 || \
+				 INTEL_DEVID(dev) == 0x5913 || \
+				 INTEL_DEVID(dev) == 0x5916 || \
+				 INTEL_DEVID(dev) == 0x5921 || \
+				 INTEL_DEVID(dev) == 0x5926)
+#define IS_KBL_ULX(dev)		(INTEL_DEVID(dev) == 0x590E || \
+				 INTEL_DEVID(dev) == 0x5915 || \
+				 INTEL_DEVID(dev) == 0x591E)
 #define IS_SKL_GT3(dev)		(IS_SKYLAKE(dev) && \
 				 (INTEL_DEVID(dev) & 0x00F0) == 0x0020)
 #define IS_SKL_GT4(dev)		(IS_SKYLAKE(dev) && \
@@ -2504,16 +2567,30 @@ struct drm_i915_cmd_table {
 
 #define IS_PRELIMINARY_HW(intel_info) ((intel_info)->is_preliminary)
 
-#define SKL_REVID_A0		(0x0)
-#define SKL_REVID_B0		(0x1)
-#define SKL_REVID_C0		(0x2)
-#define SKL_REVID_D0		(0x3)
-#define SKL_REVID_E0		(0x4)
-#define SKL_REVID_F0		(0x5)
+#define SKL_REVID_A0		0x0
+#define SKL_REVID_B0		0x1
+#define SKL_REVID_C0		0x2
+#define SKL_REVID_D0		0x3
+#define SKL_REVID_E0		0x4
+#define SKL_REVID_F0		0x5
 
-#define BXT_REVID_A0		(0x0)
-#define BXT_REVID_B0		(0x3)
-#define BXT_REVID_C0		(0x9)
+#define IS_SKL_REVID(p, since, until) (IS_SKYLAKE(p) && IS_REVID(p, since, until))
+
+#define BXT_REVID_A0		0x0
+#define BXT_REVID_A1		0x1
+#define BXT_REVID_B0		0x3
+#define BXT_REVID_C0		0x9
+
+#define IS_BXT_REVID(p, since, until) (IS_BROXTON(p) && IS_REVID(p, since, until))
+
+#define KBL_REVID_A0		0x0
+#define KBL_REVID_B0		0x1
+#define KBL_REVID_C0		0x2
+#define KBL_REVID_D0		0x3
+#define KBL_REVID_E0		0x4
+
+#define IS_KBL_REVID(p, since, until) \
+	(IS_KABYLAKE(p) && IS_REVID(p, since, until))
 
 /*
  * The genX designation typically refers to the render engine, so render
@@ -2585,17 +2662,18 @@ struct drm_i915_cmd_table {
 #define HAS_FPGA_DBG_UNCLAIMED(dev)	(INTEL_INFO(dev)->has_fpga_dbg)
 #define HAS_PSR(dev)		(IS_HASWELL(dev) || IS_BROADWELL(dev) || \
 				 IS_VALLEYVIEW(dev) || IS_CHERRYVIEW(dev) || \
-				 IS_SKYLAKE(dev))
-#define HAS_RUNTIME_PM(dev)	(IS_GEN6(dev) || IS_HASWELL(dev) || \
+				 IS_SKYLAKE(dev) || IS_KABYLAKE(dev))
+#define HAS_RUNTIME_PM(dev)	(!intel_vgpu_active(dev) && (IS_GEN6(dev) || IS_HASWELL(dev) || \
 				 IS_BROADWELL(dev) || IS_VALLEYVIEW(dev) || \
-				 IS_SKYLAKE(dev))
+				 IS_SKYLAKE(dev) || IS_KABYLAKE(dev)))
 #define HAS_RC6(dev)		(INTEL_INFO(dev)->gen >= 6)
 #define HAS_RC6p(dev)		(INTEL_INFO(dev)->gen == 6 || IS_IVYBRIDGE(dev))
 
-#define HAS_CSR(dev)	(IS_GEN9(dev))
+#define HAS_CSR(dev)	(IS_GEN9(dev) && (!intel_vgpu_active(dev) || i915_host_mediate))
 
-#define HAS_GUC_UCODE(dev)	(IS_GEN9(dev))
-#define HAS_GUC_SCHED(dev)	(IS_GEN9(dev))
+#define HAS_GUC(dev)		(IS_GEN9(dev))
+#define HAS_GUC_UCODE(dev)	(HAS_GUC(dev))
+#define HAS_GUC_SCHED(dev)	(HAS_GUC(dev))
 
 #define HAS_RESOURCE_STREAMER(dev) (IS_HASWELL(dev) || \
 				    INTEL_INFO(dev)->gen >= 8)
@@ -2611,10 +2689,11 @@ struct drm_i915_cmd_table {
 #define INTEL_PCH_LPT_LP_DEVICE_ID_TYPE		0x9c00
 #define INTEL_PCH_SPT_DEVICE_ID_TYPE		0xA100
 #define INTEL_PCH_SPT_LP_DEVICE_ID_TYPE		0x9D00
+#define INTEL_PCH_KBP_DEVICE_ID_TYPE		0xA200
 #define INTEL_PCH_P2X_DEVICE_ID_TYPE		0x7100
-#define INTEL_PCH_QEMU_DEVICE_ID_TYPE		0x2900 /* qemu q35 has 2918 */
 
 #define INTEL_PCH_TYPE(dev) (__I915__(dev)->pch_type)
+#define HAS_PCH_KBP(dev_priv) (INTEL_PCH_TYPE(dev_priv) == PCH_KBP)
 #define HAS_PCH_SPT(dev) (INTEL_PCH_TYPE(dev) == PCH_SPT)
 #define HAS_PCH_LPT(dev) (INTEL_PCH_TYPE(dev) == PCH_LPT)
 #define HAS_PCH_LPT_LP(dev) (__I915__(dev)->pch_id == INTEL_PCH_LPT_LP_DEVICE_ID_TYPE)
@@ -2651,6 +2730,7 @@ struct i915_params {
 	int enable_rc6;
 	int enable_fbc;
 	int enable_ppgtt;
+	bool ctx_switch;
 	int enable_execlists;
 	int enable_psr;
 	unsigned int preliminary_hw_support;
@@ -2660,7 +2740,6 @@ struct i915_params {
 	int enable_cmd_parser;
 	/* leave bools at the end to not create holes */
 	bool enable_hangcheck;
-	bool fastboot;
 	bool prefault_disable;
 	bool load_detect_test;
 	bool reset;
@@ -2673,6 +2752,7 @@ struct i915_params {
 	bool verbose_state_checks;
 	bool nuclear_pageflip;
 	int edp_vswing;
+	bool gen9_pg_wa_enable;
 };
 extern struct i915_params i915 __read_mostly;
 
@@ -2801,6 +2881,8 @@ int i915_gem_throttle_ioctl(struct drm_device *dev, void *data,
 			    struct drm_file *file_priv);
 int i915_gem_madvise_ioctl(struct drm_device *dev, void *data,
 			   struct drm_file *file_priv);
+int i915_gem_vgtbuffer_ioctl(struct drm_device *dev, void *data,
+			     struct drm_file *file);
 int i915_gem_set_tiling(struct drm_device *dev, void *data,
 			struct drm_file *file_priv);
 int i915_gem_get_tiling(struct drm_device *dev, void *data,
@@ -2847,7 +2929,6 @@ i915_gem_object_ggtt_pin(struct drm_i915_gem_object *obj,
 
 int i915_vma_bind(struct i915_vma *vma, enum i915_cache_level cache_level,
 		  u32 flags);
-void __i915_vma_set_map_and_fenceable(struct i915_vma *vma);
 int __must_check i915_vma_unbind(struct i915_vma *vma);
 /*
  * BEWARE: Do not use the function below unless you can _absolutely_
@@ -2919,17 +3000,15 @@ i915_seqno_passed(uint32_t seq1, uint32_t seq2)
 	return (int32_t)(seq1 - seq2) >= 0;
 }
 
-static inline bool i915_gem_request_started(struct drm_i915_gem_request *req,
-					   bool lazy_coherency)
-{
-	u32 seqno = req->ring->get_seqno(req->ring, lazy_coherency);
-	return i915_seqno_passed(seqno, req->previous_seqno);
-}
-
 static inline bool i915_gem_request_completed(struct drm_i915_gem_request *req,
 					      bool lazy_coherency)
 {
-	u32 seqno = req->ring->get_seqno(req->ring, lazy_coherency);
+	u32 seqno;
+
+	BUG_ON(req == NULL);
+
+	seqno = req->ring->get_seqno(req->ring, lazy_coherency);
+
 	return i915_seqno_passed(seqno, req->seqno);
 }
 
@@ -2979,6 +3058,7 @@ int i915_gem_init_rings(struct drm_device *dev);
 int __must_check i915_gem_init_hw(struct drm_device *dev);
 int i915_gem_l3_remap(struct drm_i915_gem_request *req, int slice);
 void i915_gem_init_swizzling(struct drm_device *dev);
+bool intel_enable_ppgtt(struct drm_device *dev);
 void i915_gem_cleanup_ringbuffer(struct drm_device *dev);
 int __must_check i915_gpu_idle(struct drm_device *dev);
 int __must_check i915_gem_suspend(struct drm_device *dev);
@@ -3311,9 +3391,6 @@ static inline bool intel_gmbus_is_forced_bit(struct i2c_adapter *adapter)
 }
 extern void intel_i2c_reset(struct drm_device *dev);
 
-/* intel_bios.c */
-bool intel_bios_is_port_present(struct drm_i915_private *dev_priv, enum port port);
-
 /* intel_opregion.c */
 #ifdef CONFIG_ACPI
 extern int intel_opregion_setup(struct drm_device *dev);
@@ -3384,6 +3461,12 @@ extern struct intel_display_error_state *intel_display_capture_error_state(struc
 extern void intel_display_print_error_state(struct drm_i915_error_state_buf *e,
 					    struct drm_device *dev,
 					    struct intel_display_error_state *error);
+#ifdef CONFIG_I915_VGT
+extern bool vgt_can_process_irq(void);
+extern bool vgt_can_process_timer(void *timer);
+extern void vgt_new_delay_event_timer(void *timer);
+extern void i915_check_vgt(struct drm_i915_private *dev_priv);
+#endif
 
 int sandybridge_pcode_read(struct drm_i915_private *dev_priv, u32 mbox, u32 *val);
 int sandybridge_pcode_write(struct drm_i915_private *dev_priv, u32 mbox, u32 val);
@@ -3414,27 +3497,59 @@ void vlv_flisdsi_write(struct drm_i915_private *dev_priv, u32 reg, u32 val);
 int intel_gpu_freq(struct drm_i915_private *dev_priv, int val);
 int intel_freq_opcode(struct drm_i915_private *dev_priv, int val);
 
-#define I915_READ8(reg)		dev_priv->uncore.funcs.mmio_readb(dev_priv, (reg), true)
-#define I915_WRITE8(reg, val)	dev_priv->uncore.funcs.mmio_writeb(dev_priv, (reg), (val), true)
+/* Intel GVT-g MMIO mediation */
+extern bool i915_host_mediate __read_mostly;
+#define __i915_read(x, y) \
+static u##x inline i915_read##x(struct drm_i915_private *dev_priv, u32 reg,	\
+		bool trace) {							\
+	u##x val = 0;								\
+	if (i915_host_mediate)							\
+		vgt_host_read((reg), &val, sizeof(u##x), false, trace);		\
+	else									\
+		val = dev_priv->uncore.funcs.mmio_read##y(dev_priv,		\
+				reg, trace);					\
+	return val;								\
+}
+__i915_read(8, b)
+__i915_read(16, w)
+__i915_read(32, l)
+__i915_read(64, q)
+#undef __i915_read
+#define __i915_write(x, y) \
+static void inline i915_write##x(struct drm_i915_private *dev_priv, u32 reg,	\
+		u##x val, bool trace)						\
+{										\
+	if (i915_host_mediate)							\
+		vgt_host_write(reg, &val, sizeof(u##x), false, trace);		\
+	else									\
+		dev_priv->uncore.funcs.mmio_write##y(dev_priv,			\
+				(reg), (val), trace);				\
+}
+__i915_write(8, b)
+__i915_write(16, w)
+__i915_write(32, l)
+__i915_write(64, q)
+#undef __i915_write
 
-#define I915_READ16(reg)	dev_priv->uncore.funcs.mmio_readw(dev_priv, (reg), true)
-#define I915_WRITE16(reg, val)	dev_priv->uncore.funcs.mmio_writew(dev_priv, (reg), (val), true)
-#define I915_READ16_NOTRACE(reg)	dev_priv->uncore.funcs.mmio_readw(dev_priv, (reg), false)
-#define I915_WRITE16_NOTRACE(reg, val)	dev_priv->uncore.funcs.mmio_writew(dev_priv, (reg), (val), false)
-
-#define I915_READ(reg)		dev_priv->uncore.funcs.mmio_readl(dev_priv, (reg), true)
-#define I915_WRITE(reg, val)	dev_priv->uncore.funcs.mmio_writel(dev_priv, (reg), (val), true)
-#define I915_READ_NOTRACE(reg)		dev_priv->uncore.funcs.mmio_readl(dev_priv, (reg), false)
-#define I915_WRITE_NOTRACE(reg, val)	dev_priv->uncore.funcs.mmio_writel(dev_priv, (reg), (val), false)
-
+#define I915_READ8(reg)			i915_read8(dev_priv, (reg), true)
+#define I915_WRITE8(reg, val)		i915_write8(dev_priv, (reg), (val), true)
+#define I915_READ16(reg)		i915_read16(dev_priv, (reg), true)
+#define I915_WRITE16(reg, val)		i915_write16(dev_priv, (reg), (val), true)
+#define I915_READ16_NOTRACE(reg)	i915_read16(dev_priv, (reg), false)
+#define I915_WRITE16_NOTRACE(reg, val)	i915_write16(dev_priv, (reg), (val), false)
+#define I915_READ(reg)			i915_read32(dev_priv, (reg), true)
+#define I915_WRITE(reg, val)		i915_write32(dev_priv, (reg), (val), true)
+#define I915_READ_NOTRACE(reg)		i915_read32(dev_priv, (reg), false)
+#define I915_WRITE_NOTRACE(reg, val)	i915_write32(dev_priv, (reg), (val), false)
 /* Be very careful with read/write 64-bit values. On 32-bit machines, they
  * will be implemented using 2 32-bit writes in an arbitrary order with
  * an arbitrary delay between them. This can cause the hardware to
  * act upon the intermediate value, possibly leading to corruption and
  * machine death. You have been warned.
  */
-#define I915_WRITE64(reg, val)	dev_priv->uncore.funcs.mmio_writeq(dev_priv, (reg), (val), true)
-#define I915_READ64(reg)	dev_priv->uncore.funcs.mmio_readq(dev_priv, (reg), true)
+#define I915_WRITE64(reg, val)		i915_write64(dev_priv, (reg), (val), true)
+#define I915_READ64(reg)		i915_read64(dev_priv, (reg), true)
+
 
 #define I915_READ64_2x32(lower_reg, upper_reg) ({			\
 	u32 upper, lower, old_upper, loop = 0;				\
@@ -3456,9 +3571,63 @@ int intel_freq_opcode(struct drm_i915_private *dev_priv, int val);
  * Note: Should only be used between intel_uncore_forcewake_irqlock() and
  * intel_uncore_forcewake_irqunlock().
  */
-#define I915_READ_FW(reg__) readl(dev_priv->regs + (reg__))
-#define I915_WRITE_FW(reg__, val__) writel(val__, dev_priv->regs + (reg__))
+#define I915_READ_FW(reg__) \
+	(i915_host_mediate ? I915_READ(reg__) : readl(dev_priv->regs + (reg__)))
+
+#define I915_WRITE_FW(reg__, val__) \
+	(i915_host_mediate ? I915_WRITE(reg__, val__) : writel(val__, dev_priv->regs + (reg__)))
+
 #define POSTING_READ_FW(reg__) (void)I915_READ_FW(reg__)
+
+#define GTT_READ32(addr)						\
+({									\
+	off_t reg = (unsigned long)(addr) -				\
+			(unsigned long)(dev_priv->gtt.gsm);		\
+	u32 __ret = 0;							\
+	if (i915_host_mediate)						\
+		vgt_host_read(reg, &__ret, sizeof(u32),			\
+						true, false);		\
+	else								\
+		__ret = readl(addr);					\
+	__ret;								\
+})
+
+#define GTT_READ64(addr)						\
+({									\
+	off_t reg = (unsigned long)(addr) -				\
+			(unsigned long)(dev_priv->gtt.gsm);		\
+	u64 __ret = 0;							\
+	if (i915_host_mediate)						\
+		vgt_host_read(reg, &__ret, sizeof(u64),			\
+						true, false);		\
+	else								\
+		__ret = readq(addr);					\
+	__ret;								\
+})
+
+#define GTT_WRITE32(val, addr)						\
+({									\
+	off_t reg = (unsigned long)(addr) -				\
+			(unsigned long)(dev_priv->gtt.gsm);		\
+	u32 __val = (val);						\
+	if (i915_host_mediate)						\
+		vgt_host_write(reg, &__val, sizeof(u32),		\
+						true, false);		\
+	else								\
+		writel((val), (addr));					\
+})
+
+#define GTT_WRITE64(val, addr)						\
+({									\
+	off_t reg = (unsigned long)(addr) -				\
+			(unsigned long)(dev_priv->gtt.gsm);		\
+	u64 __val = (val);						\
+	if (i915_host_mediate)						\
+		vgt_host_write(reg, &__val, sizeof(u64),		\
+						true, false);		\
+	else								\
+		writeq((val), (addr));					\
+})
 
 /* "Broadcast RGB" property */
 #define INTEL_BROADCAST_RGB_AUTO 0
